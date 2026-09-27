@@ -1,7 +1,7 @@
 // Integration entry. OWNER: orchestrator. Module contracts:
 //  render/pipeline.js  createPipeline({renderer, scene, camera}) -> {render(dt), setSize(w,h), setFocus?(dist)}
 //  render/lighting.js  createLighting({renderer, scene}) -> {sun, update(camera), timeOfDay}
-//  world/city.js       buildCity({scene, renderer}) -> Promise<world>
+//  world/city.js       buildCity({scene, renderer, onProgress?}) -> Promise<world>
 //                      world = {raycast(origin:Vector3, dir:Vector3, max):{point,normal,distance}|null,
 //                               groundHeight(x,z):number, spawn:Vector3, update(dt, camera)}
 //  player/player.js    createPlayer({scene, world, camera, input, renderer}) -> Promise<player>
@@ -19,6 +19,17 @@ import { SHOTS } from './shots.js';
 import { createWarmup } from './render/warmup.js'; // (perf r3)
 import { REFL_LAYER } from './world/water.js';
 import { BIG_CASTER_LAYER } from './render/csm.js';
+import { loading } from './ui/loading.js';
+
+// Loading screen: city.js build stage that just FINISHED -> [progress 0..1, what is built next]. Progress = the stage's
+// share of the measured start-up time (Apple M5, 'high'): the city takes ~9 s; the shaders + first frame after it ~2 s
+// with a warm shader cache but ~11 s with a cold one, so that last stage gets a share between the two.
+const STAGES = {
+  tex: [0.04, 'Planning the buildings'], gen: [0.19, 'Building facades and rooftops'], tiles: [0.43, 'Laying streets and parks'],
+  ground: [0.48, 'Shaping the far shores'], far: [0.50, 'Raising the bridges'], bridges: [0.51, 'Filling the horizon'],
+  hinterland: [0.52, 'Placing street furniture'], props: [0.55, 'Adding trees, traffic and people'], life: [0.60, 'Fitting collision'],
+  coll: [0.71, 'Loading Spider-Man'],
+};
 
 const params = new URLSearchParams(location.search);
 const shotName = params.get('shot');
@@ -41,6 +52,8 @@ if (renderer.capabilities.reversedDepthBuffer && !params.has('nozfix')) {
   };
 }
 document.body.appendChild(renderer.domElement);
+// a lost GPU context (out of memory, driver reset) leaves a frozen canvas: say so instead
+renderer.domElement.addEventListener('webglcontextlost', () => loading.fail('Graphics context lost', 'The GPU ran out of memory or its driver was reset. Reload to keep playing.'));
 
 const scene = new THREE.Scene();
 // far plane 150 km (foundation agent): the harbour, far shores and distant hinterland run out to the (fogged) true
@@ -48,9 +61,10 @@ const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.1, 150000);
 
 const lighting = createLighting({ renderer, scene });
-const world = await buildCity({ scene, renderer });
+const world = await buildCity({ scene, renderer, onProgress: (n) => STAGES[n] && loading.stage(STAGES[n][1], STAGES[n][0]) });
 const input = createInput(renderer.domElement);
 const player = await createPlayer({ scene, world, camera, input, renderer });
+await loading.stage('Compiling shaders', 0.73);
 const hud = createHud({ player, world, camera });
 const pipeline = createPipeline({ renderer, scene, camera, lighting });
 
@@ -79,6 +93,7 @@ if (shotName) {
   const shot = SHOTS[shotName];
   if (!shot) throw new Error('unknown shot ' + shotName);
   shot.apply(ctx);
+  loading.done(true);
   // Warm up: let shadows, TAA/accumulation, streaming settle.
   const dt = 1 / 60;
   for (let i = 0; i < (shot.frames ?? 90); i++) {
@@ -98,5 +113,6 @@ if (shotName) {
     for (const s of ctx.systems) s.update?.(dt);
     pipeline.render(dt);
     warmup?.step(); // (perf r3)
+    loading.done(); // (no-op after the first frame)
   });
 }

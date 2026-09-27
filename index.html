@@ -5,10 +5,44 @@
 <meta name="viewport" content="width=device-width,initial-scale=1" />
 <title>Spidey</title>
 <link rel="icon" href="data:," />
-<style>html,body{margin:0;height:100%;overflow:hidden;background:#000}canvas{display:block}</style>
+<link rel="stylesheet" href="/assets/ui/fonts/fonts.css" />
+<style>html,body{margin:0;height:100%;overflow:hidden;background:#000}canvas{display:block}
+/* loading / failure screen (src/ui/loading.js): colours + fonts of src/ui/systems.css, which loads later */
+#loading{position:fixed;inset:0;z-index:100;display:flex;align-items:flex-end;color:#f4f6fb;transition:opacity .45s;
+  background:radial-gradient(120% 90% at 72% 18%,#14234f 0%,#0a1230 46%,#070d1f 100%);
+  font-family:'Spidey Sans','Manrope',system-ui,'Segoe UI',Roboto,Arial,sans-serif}
+#loading[hidden]{display:none}
+#loading.out{opacity:0;pointer-events:none}
+.ld-box{box-sizing:border-box;width:min(460px,84vw);margin:0 0 9vh 6vw;padding:2px 0 4px 18px;border-left:3px solid #e3262f}
+.ld-title{font:800 clamp(36px,5vw,60px)/1 'Spidey Condensed','Barlow Condensed','Arial Narrow',sans-serif;letter-spacing:.06em;text-transform:uppercase}
+.ld-stage{margin-top:12px;font:800 16px/1.2 'Spidey Condensed','Barlow Condensed','Arial Narrow',sans-serif;letter-spacing:.14em;text-transform:uppercase;color:#b9c6e6}
+.ld-detail{margin-top:8px;font-size:14px;line-height:1.45;color:#b9c6e6;overflow-wrap:anywhere}
+.ld-bar{position:relative;height:4px;margin-top:14px;overflow:hidden;background:rgba(160,188,255,.2)}
+.ld-bar i{position:absolute;inset:0 auto 0 0;width:0;background:#e3262f;transition:width .3s ease-out}
+/* the sheen is a transform animation: it keeps moving while a build stage blocks the main thread */
+.ld-bar::after{content:'';position:absolute;inset:0;width:40%;background:linear-gradient(90deg,transparent,rgba(255,255,255,.4),transparent);animation:ldSheen 1.5s linear infinite}
+@keyframes ldSheen{from{transform:translateX(-100%)}to{transform:translateX(350%)}}
+.ld-reload{margin-top:16px;padding:9px 22px;border:1.5px solid rgba(255,255,255,.85);border-radius:4px;background:rgba(0,0,0,.35);color:#fff;cursor:pointer;
+  font:800 15px/1 'Spidey Condensed','Barlow Condensed','Arial Narrow',sans-serif;letter-spacing:.14em;text-transform:uppercase}
+.ld-reload:hover,.ld-reload:focus-visible{background:#e3262f;border-color:#e3262f;outline:none}
+.ld-reload[hidden],.ld-detail[hidden]{display:none}
+#loading.fail .ld-box{border-left-color:#f5b82e}
+#loading.fail .ld-stage{color:#f4f6fb}
+#loading.fail .ld-bar{display:none}
+@media (prefers-reduced-motion:reduce){.ld-bar::after{animation:none;display:none}#loading{transition:none}}
+</style>
 </head>
 <body>
 <div id="hud"></div>
-<script type="module" src="/src/main.js"></script>
+<div id="loading" role="status" aria-live="polite">
+  <div class="ld-box">
+    <div class="ld-title">Spidey</div>
+    <div class="ld-stage" id="ld-stage">Loading textures</div>
+    <div class="ld-detail" id="ld-detail" hidden></div>
+    <div class="ld-bar"><i id="ld-fill"></i></div>
+    <button class="ld-reload" id="ld-reload" type="button" hidden>Reload</button>
+  </div>
+</div>
+<script type="module" src="/src/boot.js"></script>
 </body>
 </html>
