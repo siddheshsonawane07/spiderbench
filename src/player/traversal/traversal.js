@@ -46,6 +46,11 @@ const SWING_GAIN = 5;       // climb assist target: exit this far above the atta
 const RELEASE_BOOST = 1.5; // m/s added along the release velocity when the web is let go (x skill 'swingReleaseBoost')
 const SWING_DRAG = 0.0022;  // aerodynamic drag while swinging (1/m): a held swing with no input decays like a real pendulum
 const PUMP_MAX_ANG = 1.15;  // pumping (W along the swing) never adds energy beyond what reaches ~75 deg of arc (chains stay in the canyon)
+// sid r1: manual reel while swinging ("add more swing options"). Shift pulls the web in at `in` m/s down to `min` m (the
+// arc tightens and climbs), C / Ctrl pays it out at up to `out` m/s (a longer, lower arc that skims the street) until
+// the bottom of the arc would bring the feet `floor` m over the floor under him (4.2 = the bus height the attach keeps
+// too). (out: 12 lowered a 2.6 s swing by only 17 m, too slow to reach the street inside one arc)
+const REEL = { in: 9, out: 16, min: 7, floor: 4.2 };
 const JUMP = 11.2, JUMP_MAX = 19.5;  // tap jump (~2.6 m, user r9: higher) / full charge (~7.9 m)
 const UP = new THREE.Vector3(0, 1, 0);
 // Swing-release / air tricks (user r10: no tucked "crouch" ball after a release — loose, athletic full-body tricks that EARN
@@ -829,6 +834,9 @@ export function createTraversal({ world, cam, web, rig, camera }) {
     // reel toward target length (lifts off the street), faster if the feet approach the floor
     const fl = floorAt(s.pos.x, s.pos.z, feetY() + 0.2);
     const clearance = feetY() - fl;
+    // sid r1: manual reel, in: Shift shortens the TARGET length, so the reel-in speed limit, the floor clearance and the
+    // auto-tension below all still apply. (Out is at the rope constraint.) The web stays attached either way (invariant #4).
+    if (I.reel > 0) S.ropeTarget = Math.max(Math.min(S.ropeTarget, REEL.min), S.ropeTarget - REEL.in * h);
     if (clearance < 2.2 && s.vel.y < 0) S.ropeTarget = Math.min(S.ropeTarget, Math.max(3, S.pivot.y - (fl + 2.4 + H)));
     { const want = damp(S.rope, S.ropeTarget, clearance < 1.5 ? 10 : (S.kind === 'low' || clearance < 4) ? 6 : 3.2, h);
       S.rope = Math.max(want, S.rope - (clearance < 3 ? 22 : 14) * h); } // reel-in speed limit: the body is never yanked along the rope
@@ -842,11 +850,20 @@ export function createTraversal({ world, cam, web, rig, camera }) {
     // rope constraint (inequality: slack allowed)
     const d = _v3.copy(s.pos).sub(S.pivot); const L = d.length();
     let tension = 0, vrIn = 0;
+    // sid r1: manual reel, out: C / Ctrl pays the web out UNDER TENSION. The rope lengthens by what he pulled on it this
+    // step, at most REEL.out m/s and no further than REEL.floor over the floor, and he keeps that much outward speed.
+    // (Lengthening the target instead outran him: the web went slack and snapped taut 38 times in 36 swings.)
+    let pay = 0;
+    if (I.reel < 0 && L > S.rope) {
+      pay = Math.max(0, Math.min(L - S.rope, REEL.out * h, S.pivot.y - (fl + REEL.floor + H) - S.rope));
+      S.rope += pay; S.ropeTarget = Math.max(S.ropeTarget, S.rope);
+    }
     if (L > S.rope) {
       d.divideScalar(L); s.pos.copy(S.pivot).addScaledVector(d, S.rope);
-      const vr = s.vel.dot(d); if (vr > 0) { s.vel.addScaledVector(d, -vr); vrIn = vr; }
+      const vr = s.vel.dot(d) - pay / h; if (vr > 0) { s.vel.addScaledVector(d, -vr); vrIn = vr; }
       const vt2 = s.vel.lengthSq(); tension = clamp((vt2 / Math.max(S.rope, 1) + GS * Math.max(0, -d.y)) / (GS * 2.6), 0, 1);
     }
+    if (pay > 0 && !tension) tension = S.tension; // (a web paying out is carrying him: it reads as taut as it was)
     // slack: over the top (angle > 90 deg without enough speed for v^2/r > g) the body free-falls inside the circle; the
     // web sags (web.setSlack) and the pose leaves the hang. When the rope catches again it snaps taut with a jolt.
     // physical criterion: required rope pull = v_t^2/L - g.(outward); < 0 means gravity out-pulls the circle -> free fall

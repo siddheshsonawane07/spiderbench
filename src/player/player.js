@@ -9,6 +9,7 @@
 // Controls: WASD move · mouse camera · RMB (hold) web-swing · Shift walk (ground) / wall-run · Space jump (hold = charge)
 //           E / MMB web-zip to highlighted point (no target in air = web-dash) · C / Ctrl drop / dive.
 //           Q / L1 (air or mid-swing) quick web boost: one-hand web to a far point ahead + forward impulse (off in combat).
+//           Shift / C, Ctrl (mid-swing) reel the web in (the arc tightens and climbs) / pay it out (skims the street) (sid r1).
 //           Web slingshot (on the ground): hold Ctrl, LMB / RMB = web to the left / right building (repeat for more),
 //           walk back (S) to stretch, release Ctrl to launch (traversal stepSling, player/slingweb.js).
 //           T (perched, zip reticle on a point): web tightrope — web to that point, stand up, W / S walk the line
