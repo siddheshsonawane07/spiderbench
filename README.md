@@ -21,6 +21,12 @@ npm run build    # production build in dist/
 
 Controls are listed in-game (press **H**). On the dev server, **~** opens a developer menu (on a build, add `?dev` to the URL).
 
+## This fork
+A fork of [xikhar/spiderbench](https://github.com/xikhar/spiderbench), kept up to date with it. It adds:
+
+- **Manual reel:** while swinging, hold **Shift** to reel the web in and climb, or **C** / **Ctrl** to let it out and skim the street. On a gamepad, use D-pad up / down.
+- **Auto swing:** press **B** and he swings through the city on his own, following the streets. **N** switches between four styles: Cruise, Dive, Acrobat and Skim. The mouse still turns the camera, and **B** gives the controls back. Crimes are switched off while it runs. Add `?auto` (or `?auto=<style>`) to the URL to start with it on, and `?autoseed=<n>` to repeat the same route.
+
 ## Disclaimer
 This is an unofficial fan project, made only as a technical demonstration. It is not affiliated with, endorsed by or sponsored by Marvel, Disney, Sony or Insomniac Games. Spider-Man and related names, characters and likenesses are trademarks and copyrighted material of their respective owners, and no rights to them are claimed. **This project is not for sale and may not be redistributed or used commercially.** See [LICENSE](LICENSE).
 
