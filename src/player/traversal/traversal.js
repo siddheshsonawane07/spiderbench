@@ -58,6 +58,8 @@ const REEL = { in: 9, out: 16, min: 7, floor: 4.2 };
 //   bottomMin / bottomMax: the bottom of the arc over the street (was clamp(8 + hEntry * 0.3, 11, 18)); with SWING_DIP 24
 //     the plunge is deeper
 //   relLo / relHi: the release pop (REL_UP) scales with how steeply he is rising when he lets go — timing is rewarded (was 1)
+const PIVOT_RAISE = 18;    // sid r3: the physics pivot rises at most this far over the drawn anchor (m)
+const PIVOT_BLEND = 0.7, PIVOT_BLEND_V = 4; // sid r3: sideways pivot -> anchor drift (1/s, and at most m/s)
 const SW2 = { keep: 0.35, latMax: 8, latDamp: 0.8, bottomMin: 5, bottomMax: 10, relLo: 0.3, relHi: 1.25 };
 const JUMP = 11.2, JUMP_MAX = 19.5;  // tap jump (~2.6 m, user r9: higher) / full charge (~7.9 m)
 const UP = new THREE.Vector3(0, 1, 0);
@@ -724,8 +726,10 @@ export function createTraversal({ world, cam, web, rig, camera }) {
       const hd = Math.hypot(S.pivot.x - s.pos.x, S.pivot.z - s.pos.z);
       if (dyc > 0.5 && S.pivot.y - L < B) {
         const u = Math.min(70, (hd * hd - dyc * dyc) / (2 * dyc));
-        if (u > S.pivot.y - y0) S.pivot.y = y0 + u;
-        S.ropeTarget = Math.max(S.ropeTarget, s.pos.distanceTo(S.pivot) - 1);
+        // sid r3: at most PIVOT_RAISE over the drawn anchor (was up to 70 m: median 26 m, 28 deg between the web on screen
+        // and the arc he flew, so the body lay along a web he was not swinging on). Past the cap the rope reels in instead.
+        if (u > S.pivot.y - y0) S.pivot.y = Math.min(y0 + u, Math.max(a.point.y + PIVOT_RAISE, S.pivot.y));
+        S.ropeTarget = Math.max(S.ropeTarget, Math.min(s.pos.distanceTo(S.pivot) - 1, S.pivot.y - fmax - H - bottomFeet));
       } }
     S.rope = s.pos.distanceTo(S.pivot); S.t = 0; S.tension = 0; S.tautT = 0; S.cornered = false; S.y0 = s.pos.y;
     S.slack = 0; S.slackT = 0; S.kick = 0; S.kickCd = 0; S.apexed = false; S.angMax = -9;
@@ -794,6 +798,17 @@ export function createTraversal({ world, cam, web, rig, camera }) {
         sideA.set(-S.dir.z, 0, S.dir.x);
       }
     }
+    // sid r3: the physics pivot drifts back under the drawn anchor (sideways only) over the swing, as Insomniac's did
+    // (GDC 2019 "Concrete Jungle Gym": the offset pivot "blends back over time"), so the arc he flies converges on the web
+    // on screen and the body, which aims at the web, lines up with its own motion. Rate-limited: a moving support, no jolt.
+    { const dx = S.anchor.x - S.pivot.x, dz = S.anchor.z - S.pivot.z, lat = dx * sideA.x + dz * sideA.z;
+      const mv = clamp(lat * (1 - Math.exp(-PIVOT_BLEND * h)), -PIVOT_BLEND_V * h, PIVOT_BLEND_V * h);
+      const L0 = s.pos.distanceTo(S.pivot);
+      S.pivot.x += sideA.x * mv; S.pivot.z += sideA.z * mv;
+      // the rope follows the move (a taut web stays exactly as taut): the drift only relocates the pivot, it never tugs or
+      // slackens the line (a fixed length here gave 20 slack frames and a rope snap in the 6 s C-reel test)
+      const dL = s.pos.distanceTo(S.pivot) - L0;
+      if (S.rope >= L0 - 0.05) { S.rope = Math.max(4, S.rope + dL); S.ropeTarget = Math.max(4, S.ropeTarget + dL); } }
     // never grind along a facade: a wall within ~2.5 m at the side pushes the body (and the virtual pivot) out
     // toward the street, so a pinned swing peels off the wall instead of dangling against the bricks
     { S.sideT = (S.sideT || 0) - h;

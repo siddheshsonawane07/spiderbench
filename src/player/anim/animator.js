@@ -234,6 +234,7 @@ export class Animator {
     this.runSpeedMem = Math.max(hs, (this.runSpeedMem || 0) - dt * 8);
     this.decel = damp(this.decel || 0, (this.prevSpeed - hs) / Math.max(dt, 1e-3), 12, dt);
     this.moveIntent = A.sub === 'sprint' ? 15 : A.sub === 'run' ? 8.5 : hs;
+    this.visArc(dt, A);
     // facing (ground yaw)
     if (!this.yawInit) { this.yaw = Math.atan2(A.lookDir?.x ?? 0, A.lookDir?.z ?? 1); if (hs > 0.5) this.yaw = Math.atan2(vel.x, vel.z); this.yawInit = true; }
     const upMode = A.mode === 'ground' || A.mode === 'land' || A.mode === 'combat' || A.mode === 'perch' || A.mode === 'rope';
@@ -918,9 +919,43 @@ export class Animator {
   // swing legs (critic r1 #1, refs 01-04): together, hanging below the hips, knees only slightly bent, toes pointed down so
   // fists-to-toes read as one long line; tucked (knees up) only at the bottom / upswing of a two-handed swing (refs 05-08).
   // Symmetric -> identical for both web hands. w: overall weight, tuck: 0..1
+  // sid r3: the arc as SEEN — the rope from the drawn anchor to his centre, in the plane of travel. traversal swings him
+  // about a virtual pivot (median 28 deg off the drawn web, 26 m above it, measured 2026-09-29), so poses keyed on its
+  // phase disagree with the web on screen. th: rope angle from straight down, + ahead of the anchor (travel-relative, so
+  // a backswing reads as a normal drop-in); rate: dth/dt smoothed; tb: seconds to the bottom (< 0 = since the bottom).
+  // The kick is TIMED to the bottom (Insomniac, GDC 2019 "Concrete Jungle Gym": an arc-scrubbed kick went sluggish on
+  // long lines) — it starts before the bottom and plays at full speed through it, whatever the rope length.
+  visArc(dt, A) {
+    const V = this.vis || (this.vis = { th: 0, rate: 0, tb: 9, since: 9, on: false, kick: 0, trail: 0 });
+    const anc = A.mode === 'swing' && A.sub !== 'release' ? A.swing?.anchor : null, vel = A.velocity, rp = A.rootPos;
+    if (!anc || !vel || !rp) { V.on = false; V.kick = damp(V.kick, 0, 4, dt); V.trail = damp(V.trail, 0, 6, dt); return V; }
+    const hs = Math.hypot(vel.x, vel.z);
+    if (hs > 1) { V.hx = vel.x / hs; V.hz = vel.z / hs; } else if (V.hx == null) { V.hx = 0; V.hz = 1; }
+    const rx = rp.x - anc.x, ry = rp.y + 0.95 - anc.y, rz = rp.z - anc.z;
+    const th = Math.atan2(rx * V.hx + rz * V.hz, Math.max(-ry, 0.01));
+    if (!V.on) { V.on = true; V.th = th; V.rate = 0; V.since = th >= 0 ? 0.3 : 9; }
+    const r = dt > 0 ? (th - V.th) / dt : 0;
+    if (Math.abs(r) < 6) V.rate = damp(V.rate, r, 14, dt); // > 6 rad/s = a re-anchor jump, not motion
+    if (V.th < 0 && th >= 0) V.since = 0; else V.since += dt;
+    V.th = th;
+    V.tb = th < 0 && V.rate > 0.25 ? -th / V.rate : -V.since;
+    // kick: in from 0.28 s before the bottom, full by 0.12 s after, held to 0.45 s, easing to a 35 % pike on the upswing
+    const t = -V.tb;
+    const k = t < 0.12 ? smooth((t + 0.28) / 0.4) : t < 0.45 ? 1 : lerp(1, 0.35, smooth((t - 0.45) / 0.5));
+    V.kick = damp(V.kick, V.tb > 1.2 ? 0 : k, 18, dt);
+    // trail: legs sweep back and the body opens (hollow) while he drops in toward the bottom
+    V.trail = damp(V.trail, th < 0 ? smooth(-th / 0.45) * (1 - V.kick) : 0, 10, dt);
+    return V;
+  }
   swingLegs(w, tuck, hand = 'R') {
     if (w < 0.005) return;
     const b = this.b, rd = this.rd, L = rd.legLen, l1 = rd.l1, l2 = rd.l2;
+    // sid r3: trail (legs back, body open, dropping in) -> kick (legs sweep forward and up through the bottom, timed by
+    // visArc) -> pike; the upswing tuck gives way while the kick plays
+    const V = this.vis || {}, kick = V.kick || 0, trail = V.trail || 0;
+    tuck *= 1 - kick; // (0.7 left a 90-degree 'chair' knee in the kick)
+    if (trail > 0.01) b.rotE('spine', -0.12 * trail * w, 0, 0); // hollow / open chest dropping in
+    if (kick > 0.01) { b.rotE('spine', 0.16 * kick * w, 0, 0); b.rotE('hips', -0.22 * kick * w, 0, 0); } // pike: hips lead the kick
     // targets from the pelvis centre (not each hip) so a rolled pelvis still gives legs exactly together
     const hL = b.pos('upperLegL', new THREE.Vector3()), hR = b.pos('upperLegR', new THREE.Vector3());
     const mid = hL.clone().add(hR).multiplyScalar(0.5);
@@ -940,8 +975,11 @@ export class Animator {
       // polish: knees pulled higher toward the chest on the upswing tuck
       const th = new THREE.Vector3(0, 0.62, 1).normalize().multiplyScalar(l1), sh = new THREE.Vector3(0, -1, -0.4).normalize().multiplyScalar(l2 * 0.98);
       const tk = foot0.clone().add(th).add(sh);
+      hang.add(new THREE.Vector3(0, 0.03 * L * trail, -0.32 * L * trail)); // sid r3: trailing, nearly straight
+      const pike = foot0.clone().add(new THREE.Vector3(0, -0.6 * L, 0.74 * L + lead * 0.5)); // ~50 deg forward-up, legs long (not a chair)
+      hang.lerp(pike, kick);
       const ank = hang.lerp(tk, tuck);
-      const knee = hip.clone().lerp(ank, 0.5).add(new THREE.Vector3(0, 0.25 * tuck, 0.5 + 0.2 * tuck));
+      const knee = hip.clone().lerp(ank, 0.5).add(new THREE.Vector3(0, 0.25 * tuck + 0.12 * kick, 0.5 + 0.2 * tuck - 0.1 * kick));
       b.ik('leg', S, ank, knee, w, { absolute: true });
       // toes: relaxed point (continues the shin, a little forward); tucked -> more pointed
       const kp = b.pos('lowerLeg' + S, new THREE.Vector3()), ap = b.pos('foot' + S, new THREE.Vector3());
@@ -2659,7 +2697,8 @@ function makeNodes(S) {
           if (Math.abs(rate) < 6) { if (rate > 0.12) L.data.fwd = 1; else if (rate < -0.12) L.data.fwd = -1; } // >6 rad/s = re-anchor jump
         }
         L.data.angPrev = ang; if (!L.data.fwd) L.data.fwd = 1;
-        const phT = clamp(sw.phase ?? 0, -1, 1) * L.data.fwd;
+        // sid r3: from the arc as seen (visArc: travel-relative already), not traversal's virtual-pivot phase
+        const phT = S.vis?.on ? clamp(S.vis.th / 1.25, -1, 1) : clamp(sw.phase ?? 0, -1, 1) * L.data.fwd;
         L.data.ph = damp(L.data.ph, phT, 8, S.dt);
         const ph = L.data.ph, bank = clamp(sw.bank ?? 0, -1, 1);
         if (L.data.hand === (sw.hand || 'R')) { S.swingPh = ph; S.swingPhHand = L.data.hand; } // travel-relative phase for the two-hand grip (postWeb)

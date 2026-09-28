@@ -82,7 +82,9 @@ export function createChaseCamera(camera, world) {
         // swing: frame the ARC — recenter behind the swing plane direction, not the instantaneous velocity (which
         // reverses over the top / on back-swings and would whip the camera into the facade)
         wantYaw = Math.atan2(p.swingDir.x, p.swingDir.z); rate = 2.2;
-        wantPitch = clamp(0.1 - vel.y * 0.006, -0.12, 0.3);
+        // sid r3: the arc on screen (Insomniac, GDC 2019): the downswing keeps the horizon (flat, was up to 0.3 looking down),
+        // the upswing drops the camera under him looking up, so he rises through the frame
+        wantPitch = clamp(0.08 - Math.max(0, vel.y) * 0.014, -0.25, 0.08);
       }
       else if (hs > 2.5 && !(p.sling > 0) && !p.noAuto) { // (web slingshot: stepping backward never swings the camera round; combat lunges: the combat camera frames the fight)
         wantYaw = Math.atan2(vel.x, vel.z);
