@@ -20,6 +20,7 @@ import { createTravel } from './travel.js';
 import { createPhoto } from './photo.js';
 import { createSuits, SUITS } from './suits.js';
 import { createSkillFx } from './skillfx.js';
+import { createAutoSwing } from './autoswing.js';
 import { createUI } from '../../ui/menus/ui.js';
 import { createPauseMenu } from '../../ui/menus/pause.js';
 import { createPhotoUI } from '../../ui/menus/photo.js';
@@ -61,6 +62,7 @@ export function initSystems(ctx) {
   sys.photo = createPhoto(sys);
   sys.pause = createPauseMenu(sys);
   sys.photoUI = createPhotoUI(sys);
+  sys.auto = createAutoSwing(sys); // auto swing (B): he swings through the city on his own
   // user r-symbiote: Classic / Stealth / Negative / Noir were removed; old saves wearing one fall back to Advanced
   if (!SUITS.some(s => s.id === save.state.suit)) { save.state.suit = 'advanced'; save.markDirty(); }
   if (save.state.suitsUnlocked) save.state.suitsUnlocked = save.state.suitsUnlocked.filter(id => SUITS.some(s => s.id === id));
@@ -287,6 +289,7 @@ export function initSystems(ctx) {
       setCombat(!!(ctx.combat?.engaged ?? window.__cmb?.state?.engaged ?? inCombat));
       const wp = sys.travel.waypoint;
       if (inCombat) ui.objective(null);
+      else if (sys.auto.on) ui.objective({ cap: 'Auto swing', text: sys.auto.label });
       else if (wp) { const d = Math.hypot(wp.x - p.x, wp.z - p.z); pinList.push({ kind: 'label', pos: wp.clone().setY(wp.y - 1.2), label: d > 1000 ? (d / 1000).toFixed(1) + ' km' : Math.round(d) + ' m', edge: false }); ui.objective({ cap: 'Waypoint', text: 'Travel to the marked location', dist: sys.travel.routeLength ?? d }); }
       else if (!sys.crimes.active) { const t = sys.towers.nearestInactive(p); if (t) ui.objective({ cap: 'Objective', text: `Activate the ${data.districts.find(x => x.id === t.district).name} tower`, dist: Math.hypot(t.pos.x - p.x, t.pos.z - p.z) }); else ui.objective(null); }
       else ui.objective(null);
@@ -337,6 +340,7 @@ export function initSystems(ctx) {
     state() { const st = save.state; return { mode: flow.mode, level: st.level, xp: st.xp, sp: st.skillPoints, towers: st.towers.length, backpacks: st.backpacks.length, landmarks: st.landmarks.length, photos: st.secretPhotos.length, crime: sys.crimes.active?.type || null, crimeState: sys.crimes.active?.state || null, waypoint: !!sys.travel.waypoint, route: sys.travel.route?.length || 0, suit: st.suit, menu: sys.pause.tab || null }; },
   };
   window.__sys = sys;
+  if (q.has('auto')) sys.auto.set(true, q.get('auto')); // ?auto / ?auto=<style>: after the saved position is restored
   const prevPt = window.__ptState;
   window.__ptState = () => ({ ...(prevPt ? prevPt() : {}), sys: sys.debug.state() });
   console.info(`[systems] open world ready in ${(performance.now() - t0).toFixed(0)} ms: ${data.towers.length} towers, ${data.stations.length} stations, ${data.backpacks.length} backpacks, ${data.landmarks.length} landmarks, ${data.secretPhotos.length} secret photos`);
