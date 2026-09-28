@@ -1,7 +1,7 @@
 // Integration entry. OWNER: orchestrator. Module contracts:
 //  render/pipeline.js  createPipeline({renderer, scene, camera}) -> {render(dt), setSize(w,h), setFocus?(dist)}
 //  render/lighting.js  createLighting({renderer, scene}) -> {sun, update(camera), timeOfDay}
-//  world/city.js       buildCity({scene, renderer, onProgress?}) -> Promise<world>
+//  world/city.js       buildCity({scene, renderer}) -> Promise<world>
 //                      world = {raycast(origin:Vector3, dir:Vector3, max):{point,normal,distance}|null,
 //                               groundHeight(x,z):number, spawn:Vector3, update(dt, camera)}
 //  player/player.js    createPlayer({scene, world, camera, input, renderer}) -> Promise<player>
@@ -19,20 +19,11 @@ import { SHOTS } from './shots.js';
 import { createWarmup } from './render/warmup.js'; // (perf r3)
 import { REFL_LAYER } from './world/water.js';
 import { BIG_CASTER_LAYER } from './render/csm.js';
-import { loading } from './ui/loading.js';
-
-// Loading screen: city.js build stage that just FINISHED -> [progress 0..1, what is built next]. Progress = the stage's
-// share of the measured start-up time (Apple M5, 'high'): the city takes ~9 s; the shaders + first frame after it ~2 s
-// with a warm shader cache but ~11 s with a cold one, so that last stage gets a share between the two.
-const STAGES = {
-  tex: [0.04, 'Planning the buildings'], gen: [0.19, 'Building facades and rooftops'], tiles: [0.43, 'Laying streets and parks'],
-  ground: [0.48, 'Shaping the far shores'], far: [0.50, 'Raising the bridges'], bridges: [0.51, 'Filling the horizon'],
-  hinterland: [0.52, 'Placing street furniture'], props: [0.55, 'Adding trees, traffic and people'], life: [0.60, 'Fitting collision'],
-  coll: [0.71, 'Loading Spider-Man'],
-};
 
 const params = new URLSearchParams(location.search);
 const shotName = params.get('shot');
+// loading screen (index.html): stage labels + progress; it fades out once the first frames and the game systems are up
+const boot = window.__boot || { stage: async () => {}, sub() {}, done() {} };
 
 const renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: 'high-performance', stencil: false, reversedDepthBuffer: true });
 renderer.setPixelRatio(Math.min(devicePixelRatio, 1.5));
@@ -52,8 +43,6 @@ if (renderer.capabilities.reversedDepthBuffer && !params.has('nozfix')) {
   };
 }
 document.body.appendChild(renderer.domElement);
-// a lost GPU context (out of memory, driver reset) leaves a frozen canvas: say so instead
-renderer.domElement.addEventListener('webglcontextlost', () => loading.fail('Graphics context lost', 'The GPU ran out of memory or its driver was reset. Reload to keep playing.'));
 
 const scene = new THREE.Scene();
 // far plane 150 km (foundation agent): the harbour, far shores and distant hinterland run out to the (fogged) true
@@ -61,10 +50,11 @@ const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.1, 150000);
 
 const lighting = createLighting({ renderer, scene });
-const world = await buildCity({ scene, renderer, onProgress: (n) => STAGES[n] && loading.stage(STAGES[n][1], STAGES[n][0]) });
+const world = await buildCity({ scene, renderer });
 const input = createInput(renderer.domElement);
+await boot.stage('player');
 const player = await createPlayer({ scene, world, camera, input, renderer });
-await loading.stage('Compiling shaders', 0.73);
+await boot.stage('shaders');
 const hud = createHud({ player, world, camera });
 const pipeline = createPipeline({ renderer, scene, camera, lighting });
 
@@ -83,17 +73,20 @@ window.__ctx = ctx;
 const warmup = !shotName && !params.has('nowarm') ? createWarmup(renderer, scene, camera, { mirrorLayers: [REFL_LAYER, BIG_CASTER_LAYER] }) : null;
 // first the state the first frame would set that is part of the program keys: the sky IBL (scene.environment, from the
 // first lighting update) and the pipeline's NO_SSR material defines
-if (warmup) { lighting.update(camera); pipeline.prepareMaterials?.(); warmup.rescan(); warmup.flush(); }
-if (!shotName) import('./game/systems/index.js').then(m => m.initSystems(ctx)).catch(e => console.error('[systems] init failed', e)) // open-world systems (C5)
+if (warmup) { lighting.update(camera); pipeline.prepareMaterials?.(); warmup.rescan(); warmup.flush(); await warmup.settle(k => boot.sub(k)); }
+await boot.stage('frame');
+let framesDrawn = 0;
+const systemsReady = shotName ? Promise.resolve() : import('./game/systems/index.js').then(m => m.initSystems(ctx)).catch(e => console.error('[systems] init failed', e)) // open-world systems (C5)
   .then(() => import('./game/combat/index.js')).then(m => m.initCombat(ctx)).catch(e => console.error('[combat] init failed', e)) // combat (C5)
   .then(() => warmup?.rescan()); // (perf r3) + the meshes the systems / combat added (trickled by warmup.step)
+// the loading screen goes once the game systems (HUD, save position) are in and a few frames have been drawn
+systemsReady.then(async () => { boot.sub(0.8); while (framesDrawn < 4) await new Promise(r => requestAnimationFrame(r)); boot.done(); });
 ctx.timeScale = 1; // global game-time scale (combat hit-stop / slow-mo); ctx.realDt = unscaled frame time
 
 if (shotName) {
   const shot = SHOTS[shotName];
   if (!shot) throw new Error('unknown shot ' + shotName);
   shot.apply(ctx);
-  loading.done(true);
   // Warm up: let shadows, TAA/accumulation, streaming settle.
   const dt = 1 / 60;
   for (let i = 0; i < (shot.frames ?? 90); i++) {
@@ -106,13 +99,20 @@ if (shotName) {
   window.__shotReady = true;
 } else {
   const clock = new THREE.Clock();
-  renderer.setAnimationLoop(() => {
-    ctx.realDt = Math.min(clock.getDelta(), 1 / 20);
+  function frame(realDt) {
+    ctx.realDt = realDt;
     const dt = ctx.realDt * (ctx.timeScale ?? 1);
     player.update(dt); world.update(dt, camera); lighting.update(camera); hud.update(dt);
     for (const s of ctx.systems) s.update?.(dt);
     pipeline.render(dt);
     warmup?.step(); // (perf r3)
-    loading.done(); // (no-op after the first frame)
+    if (++framesDrawn === 1) boot.sub(0.4); // the first frame (remaining uploads / links) is in
+  }
+  // tools (tools/film.mjs): ctx.manualStep = true pauses the real-time loop; ctx.stepFrame(dt) then advances exactly one
+  // frame of dt seconds (deterministic frame-by-frame captures of fast motion)
+  ctx.stepFrame = dt => frame(dt);
+  renderer.setAnimationLoop(() => {
+    const d = Math.min(clock.getDelta(), 1 / 20);
+    if (!ctx.manualStep) frame(d);
   });
 }
