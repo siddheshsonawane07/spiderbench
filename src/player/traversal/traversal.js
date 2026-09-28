@@ -41,7 +41,7 @@ const SWING_JUMP_VY = 22;   // Space-release: max upward speed after the pop (no
 const REL_NOTRICK = 4.0;    // release with no trick: forward m/s standing in for the trick's snap boost
 const REL_UP = 9;           // every swing release: upward pop (m/s; vy = max(vy + pop, 0.75 pop), capped at REL_UP_VY) —
 const REL_UP_VY = 16;       // user r10f: chained swings must climb ("give more height after each swing"); Space-release pops higher
-const SWING_DIP = 6;
+const SWING_DIP = 24;   // sid r2: deeper plunge (was 6)
 const SWING_GAIN = 5;       // climb assist target: exit this far above the attach height (m) — user r10f        // max arc dip below the attach height (m) — user r10f
 const RELEASE_BOOST = 1.5; // m/s added along the release velocity when the web is let go (x skill 'swingReleaseBoost')
 const SWING_DRAG = 0.0022;  // aerodynamic drag while swinging (1/m): a held swing with no input decays like a real pendulum
@@ -51,6 +51,14 @@ const PUMP_MAX_ANG = 1.15;  // pumping (W along the swing) never adds energy bey
 // the bottom of the arc would bring the feet `floor` m over the floor under him (4.2 = the bus height the attach keeps
 // too). (out: 12 lowered a 2.6 s swing by only 17 m, too slow to reach the street inside one arc)
 const REEL = { in: 9, out: 16, min: 7, floor: 4.2 };
+// sid r2: "make the swings look more Spider-Man" (measured against the r17 swing on ?autoseed=1, 2026-09-29):
+//   keep / latMax: the pivot keeps this share of the anchor's sideways offset (at most latMax m), so a web to a building on
+//     one side carries him out toward it and back: the weave down an avenue (was keep 0). latDamp: the in-plane side
+//     damping, loosened so the weave survives (was 2.5).
+//   bottomMin / bottomMax: the bottom of the arc over the street (was clamp(8 + hEntry * 0.3, 11, 18)); with SWING_DIP 24
+//     the plunge is deeper
+//   relLo / relHi: the release pop (REL_UP) scales with how steeply he is rising when he lets go — timing is rewarded (was 1)
+const SW2 = { keep: 0.35, latMax: 8, latDamp: 0.8, bottomMin: 5, bottomMax: 10, relLo: 0.3, relHi: 1.25 };
 const JUMP = 11.2, JUMP_MAX = 19.5;  // tap jump (~2.6 m, user r9: higher) / full charge (~7.9 m)
 const UP = new THREE.Vector3(0, 1, 0);
 // Swing-release / air tricks (user r10: no tucked "crouch" ball after a release — loose, athletic full-body tricks that EARN
@@ -691,9 +699,10 @@ export function createTraversal({ world, cam, web, rig, camera }) {
     // physics pivot: the real anchor with part of its lateral offset removed (keeps the arc in the travel plane; corner swings keep more)
     // (always fully in-plane: corner turns are done by steering the plane, never by a laterally offset pivot — an
     // offset pivot plus rope reel-in was the source of sideways position jumps)
-    const keep = 0.0;
+    const keep = SW2.keep; // sid r2: part of it is kept (the weave), capped at SW2.latMax m
     const dx = a.point.x - s.pos.x, dz = a.point.z - s.pos.z, along = dx * S.dir.x + dz * S.dir.z;
-    const lx = dx - S.dir.x * along, lz = dz - S.dir.z * along;
+    let lx = dx - S.dir.x * along, lz = dz - S.dir.z * along;
+    { const ll = Math.hypot(lx, lz) * keep; if (ll > SW2.latMax) { lx *= SW2.latMax / ll; lz *= SW2.latMax / ll; } }
     S.pivot.set(s.pos.x + S.dir.x * along + lx * keep, a.point.y, s.pos.z + S.dir.z * along + lz * keep);
     const L = s.pos.distanceTo(S.pivot);
     // no ground scraping: the bottom of the arc keeps the feet >= 2.4 m over the highest floor under the arc
@@ -701,7 +710,7 @@ export function createTraversal({ world, cam, web, rig, camera }) {
     for (const k of [0, 0.5, 1, 1.4]) { const x = s.pos.x + (S.pivot.x - s.pos.x) * k, z = s.pos.z + (S.pivot.z - s.pos.z) * k; fmax = Math.max(fmax, floorAt(x, z, S.pivot.y - 2)); }
     // arc depth: dip toward the street (Insomniac look) but keep the feet over bus height; higher entries dip deeper
     const hEntry = s.pos.y - H - fmax;
-    let bottomFeet = a.kind === 'low' ? 3.0 : Math.max(fmax < 1 ? 4.2 : 2.6, clamp(8 + hEntry * 0.3, 11, 18));
+    let bottomFeet = a.kind === 'low' ? 3.0 : Math.max(fmax < 1 ? 4.2 : 2.6, clamp(4 + hEntry * 0.15, SW2.bottomMin, SW2.bottomMax)); // sid r2
     // user r10f: chained swings climb — the arc dips at most SWING_DIP below the entry, so every swing exits near its
     // entry height and the release pop (REL_UP) nets height each time (the street-dip look above still applies low down)
     if (a.kind !== 'low') bottomFeet = Math.max(bottomFeet, hEntry - SWING_DIP);
@@ -792,7 +801,7 @@ export function createTraversal({ world, cam, web, rig, camera }) {
         for (const sg of [1, -1]) { const hh = world.raycast(s.pos, _v2.copy(sideA).multiplyScalar(sg), 2.5); if (hh && Math.abs(hh.normal.y) < 0.5) { S.sideN = (S.sideN || new THREE.Vector3()).set(hh.normal.x, 0, hh.normal.z).normalize(); S.sideK = 1 - hh.distance / 2.5; } } }
       if (S.sideN) { s.vel.addScaledVector(S.sideN, 10 * S.sideK * h); S.pivot.addScaledVector(S.sideN, 3 * S.sideK * h); } }
     // keep the pendulum in its plane: sideways velocity decays -> no drift into facades
-    { const vl = s.vel.dot(sideA); s.vel.addScaledVector(sideA, -vl * (1 - Math.exp(-2.5 * h))); }
+    { const vl = s.vel.dot(sideA); s.vel.addScaledVector(sideA, -vl * (1 - Math.exp(-SW2.latDamp * h))); } // sid r2: looser (the weave)
     corridor(h, inD);
     const spd = s.vel.length();
     // Insomniac "pump": ONLY with stick input along the swing direction while moving forward along the arc, strongest at
@@ -1011,9 +1020,11 @@ export function createTraversal({ world, cam, web, rig, camera }) {
     // release inertia (user feedback #4b): the velocity at the instant of release — tangent to the arc, speed AND
     // direction — carries over 1:1, plus a small constant boost along that same direction. No resets / clamps / re-aim.
     const sp = s.vel.length();
+    // sid r2: release timing — rising steeply at the let-go earns up to relHi of the pop, the bottom of the arc relLo
+    const timing = clamp(SW2.relLo + 1.2 * s.vel.y / Math.max(sp, 1), SW2.relLo, SW2.relHi);
     if (sp > 0.5) s.vel.multiplyScalar((sp + releaseBoost() + CHAIN_REL * (s.chain || 0)) / sp); // + momentum chain (r10g)
     const k = releaseBoost() / RELEASE_BOOST, hv = hdir(s.vel, new THREE.Vector3()) || new THREE.Vector3(Math.sin(s.facing), 0, Math.cos(s.facing));
-    if (kind !== 'jump') s.vel.y = Math.min(Math.max(s.vel.y, REL_UP_VY), Math.max(s.vel.y + REL_UP * k, REL_UP * 0.75 * k));
+    if (kind !== 'jump') { const ku = k * timing; s.vel.y = Math.min(Math.max(s.vel.y, REL_UP_VY), Math.max(s.vel.y + REL_UP * ku, REL_UP * 0.75 * ku)); }
     if (kind === 'jump') { // user r11: Space-release = stronger forward push + a jump-off-the-web pop up
       s.vel.x += hv.x * SWING_JUMP * k; s.vel.z += hv.z * SWING_JUMP * k;
       s.vel.y = Math.min(SWING_JUMP_VY, Math.max(s.vel.y + SWING_JUMP_UP, SWING_JUMP_UP * 0.85));

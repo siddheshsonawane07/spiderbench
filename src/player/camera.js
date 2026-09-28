@@ -145,7 +145,8 @@ export function createChaseCamera(camera, world) {
       const wk = (p.walkK || 0) * (1 - smooth(speed, 2.2, 4.5));
       wantDist -= 0.45 * wk; wantH -= 0.1 * wk;
     }
-    else if (swinging) { wantDist = 3.6 + clamp((speed - 12) * 0.025, 0, 0.7); wantH = 0.35 + (p.tension || 0) * 0.25; wantSide = 0.15; }
+    else if (swinging) { wantDist = 4.4 + clamp((speed - 12) * 0.035, 0, 1.1); // sid r2: sits back to show the arc (was 3.6 + up to 0.7)
+      wantH = 0.35 + (p.tension || 0) * 0.25; wantSide = 0.15; }
     else if (air) { wantDist = dive ? 3.9 : 3.8 + clamp((speed - 12) * 0.025, 0, 0.7); wantH = dive ? 0.9 : 0.15; wantSide = 0.2; }
     else if (m === 'wall') { wantDist = 4.8; wantH = p.sub === 'wallRun' ? 0.2 : 0; wantSide = 0; }
     else if (m === 'perch') { wantDist = 4.3; wantH = 0.25; wantSide = 0.4; }
