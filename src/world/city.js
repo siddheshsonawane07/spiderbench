@@ -30,6 +30,7 @@ import { buildFlags } from './flags.js';
 import { buildRooftops } from './rooftops.js';
 import { buildSignage } from './signage.js'; // billboards: city-wide signage
 import { buildNeon } from './neon.js'; // (night) exterior neon + LED strips on shops, awnings, canopies
+import { buildSkyTraffic } from './skytraffic.js'; // (sid r4) helicopters, airliners, a blimp, rooftop obstruction lights
 import { attachLife } from './npc/life.js';
 import { applyDistanceFade } from './pool.js';
 import { batchTiles } from './tilebatch.js'; // (perf)
@@ -191,6 +192,9 @@ export async function buildCity({ scene, renderer }) {
   const { groundHeight, raycast, surfaceAt } = makeQueries(grid, terrainHeight);
   const geoDebug = createGeoDebug(root, grid, zips, collisionDebugLines);
   await tick('coll');
+  // (sid r4) after the collision grid: a roof light sits on whatever the raycast finds on top of its tower
+  const sky = buildSkyTraffic({ scene: root, footprints: gen.footprints, buildings: gen.buildings, raycast });
+  console.log('[city] (sid r4) sky traffic', JSON.stringify(sky.stats));
 
   const spawn = new THREE.Vector3(250, 0, 160 + G.ST_HALF + 2.3); // on the centre line, in the south crosswalk
   const viewpoints = makeViewpoints(gen, spawn, hero);
@@ -221,6 +225,7 @@ export async function buildCity({ scene, renderer }) {
       ground.update(dt, camera);
       const g1_ = P0_ ? performance.now() : 0;
       boats.update(dt);
+      sky.update(dt, camera); // (sid r4)
       highways.update(dt, camera);
       if (P0_) { const g2_ = performance.now(), a_ = (k, v) => { P0_[k] = (P0_[k] ?? v) * 0.95 + v * 0.05; P0_[k + 'Max'] = Math.max(P0_[k + 'Max'] || 0, v); }; a_('ground', g1_ - g0_); a_('highways', g2_ - g1_); }
       // (citylife bridges) bridgeTraffic.update removed: see npc/traffic.js
