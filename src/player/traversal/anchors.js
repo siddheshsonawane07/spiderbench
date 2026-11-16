@@ -113,6 +113,24 @@ export function createAnchorFinder(world, index, zipPoints) {
   return {
     // tree canopies near p (for camera foliage avoidance): [{pos, cy, r}]
     canopies(p) { return treePoints(p); },
+    // (sid r5) twin-web swing: the best confirmed wall anchor on EACH side of the travel line, or null when the street
+    // does not offer a matched pair (both sides, ropes within 45 % of each other, tops within 14 m). Same altitude band
+    // and candidate scoring as find()'s wide pass; lat < 0 is the left of travel.
+    findPair(pos, fwd, speed, floorY) {
+      if (!index.ok) return null;
+      const right = new THREE.Vector3(-fwd.z, 0, fwd.x);
+      const deckY = world.bridgeDeckY?.(pos.x, pos.z);
+      const streetY = deckY != null && deckY > 3 ? Math.min(floorY, deckY) : Math.min(floorY, world.groundHeight(pos.x, pos.z, 0.6));
+      const band = streetY + THREE.MathUtils.clamp(30 + speed * 0.25, 30, 40);
+      const P = { ahead: THREE.MathUtils.clamp(16 + speed * 0.7, 22, 46), up: 26, radius: 95, minAbove: pos.y > band - 4 ? 1.5 : 4, minL: 8, maxL: 95, minAhead: 4, maxLat: 40, elevLo: pos.y > band - 4 ? 0.12 : 0.3, elevHi: 1.4, turn: null };
+      const D = new THREE.Vector3(pos.x + fwd.x * P.ahead, Math.max(pos.y + P.minAbove + 1, Math.min(pos.y + P.up, band)), pos.z + fwd.z * P.ahead);
+      const list = faceCandidates(pos, D, fwd, right, P).slice(); // confirm() below does not touch the list, but keep our own copy
+      const pick = (sgn) => { let n = 0; for (const c of list) { if (c.lat * sgn < 3) continue; if (++n > 6) break; const a = confirm(pos, c, true); if (a) return a; } return null; };
+      const L = pick(-1); if (!L) return null;
+      const Rr = pick(1); if (!Rr) return null;
+      if (Math.abs(L.L - Rr.L) > 0.45 * Math.max(L.L, Rr.L) || Math.abs(L.point.y - Rr.point.y) > 14) return null;
+      return { left: L, right: Rr };
+    },
     // pos: body centre; fwd: horizontal travel dir (unit); turn: horizontal steer dir or null; speed: m/s
     find(pos, fwd, turn, speed, floorY) {
       const want = turn ? fwd.clone().multiplyScalar(0.55).addScaledVector(turn, 0.9).normalize() : fwd;

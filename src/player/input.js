@@ -15,6 +15,7 @@
 //   Ctrl (held, on the ground) + LMB / RMB  web slingshot: anchor a web to the left / right building (no swing / attack)
 //   T               web tightrope (perched only): web to the highlighted point, then walk it (W / S)   —
 //   Shift / C, Ctrl (mid-swing) reel the web in / pay it out (sid r1)                   D-pad up / down
+//   X (held as the web fires) twin-web swing: one web to each side of the street (sid r5)   L3 (left stick click)
 //
 // state: move {x,y} (x = right, y = forward, -1..1), look {dx,dy} (pixels-equivalent),
 //   swing, sprint, walk (Shift only, keyboard), jump, zip, drop, quick, rope (T) (held) + <name>Pressed / <name>Released edge flags, jumpHeld (seconds),
@@ -84,6 +85,7 @@ export function createInput(el) {
     let zip = has('KeyE') || !!(btn & 2);
     let quick = has('KeyQ');
     const rope = has('KeyT');
+    let twin = has('KeyX'); // (sid r5) held when a swing starts: twin-web swing
     let drop = has('KeyC') || has('ControlLeft') || has('ControlRight');
     // (sid r1) manual reel, read only while swinging. From the keys, not from `sprint`: on the pad R2 is swing AND sprint
     let reel = (has('ShiftLeft') || has('ShiftRight') ? 1 : 0) - (drop ? 1 : 0);
@@ -104,10 +106,11 @@ export function createInput(el) {
       quick ||= b(4) && !b(5); // L1 alone (L1+R1 = combat throw)
       swing ||= rt && !zipCombo; sprint ||= rt && !zipCombo; jump ||= b(0); zip ||= zipCombo || b(3); drop ||= b(1);
       if (b(12) !== b(13)) reel = b(12) ? 1 : -1;
+      twin ||= b(10);
     }
     tapped.clear();
     const len = Math.hypot(mx, my); if (len > 1) { mx /= len; my /= len; }
-    Object.assign(state, { move: { x: mx, y: my }, look: { dx: lx, dy: ly }, swing, jump, zip, drop, sprint, walk, quick, rope, reel, usingPad, ctrl, slingL, slingR });
+    Object.assign(state, { move: { x: mx, y: my }, look: { dx: lx, dy: ly }, swing, jump, zip, drop, sprint, walk, quick, rope, reel, twin, usingPad, ctrl, slingL, slingR });
     for (const k of ['swing', 'jump', 'zip', 'drop', 'sprint', 'walk', 'quick', 'rope']) {
       state[k + 'Pressed'] = state[k] && !prev[k];
       state[k + 'Released'] = !state[k] && prev[k];

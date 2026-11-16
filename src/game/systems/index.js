@@ -64,6 +64,13 @@ export function initSystems(ctx) {
   sys.pause = createPauseMenu(sys);
   sys.photoUI = createPhotoUI(sys);
   sys.auto = createAutoSwing(sys); // auto swing (B): he swings through the city on his own
+  // (sid r5) Z: the next style of the ordinary swing (player/traversal/traversal.js SWING_STYLES)
+  flow.onKey((e, mode) => {
+    if (mode !== 'play' || e.repeat || e.code !== 'KeyZ') return false;
+    const st = ctx.player.traversal.setSwingStyle();
+    ui.toast({ title: 'Swing Style', text: st.name, icon: 'swing', tone: 'cyan' });
+    return true;
+  });
   // developer menu (~): dev server, or ?dev on a build (registered after the pause menu: its keys win)
   if (import.meta.env?.DEV || new URLSearchParams(location.search).has('dev')) sys.dev = createDevMenu(sys);
   // user r-symbiote: Classic / Stealth / Negative / Noir were removed; old saves wearing one fall back to Advanced

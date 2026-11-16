@@ -75,6 +75,28 @@ const UP = new THREE.Vector3(0, 1, 0);
 //   boost = m/s added along the horizontal travel direction (x skill 'swingReleaseBoost'), up = m/s vertical,
 //   steer = max rad the heading turns toward the stick, side = m/s lateral drift (toward the stick),
 //   dur must match animator.js PTRICK.
+// sid r5 (2026-11-16): three more ways to swing and three styles of the ordinary one. All of it is ADDED: with no X held,
+// no hard turn at the attach, no Shift past 60 deg of arc and the default style, every line below computes what it did
+// before. ?noswx switches the three types off; ?swingstyle=<id> picks a style.
+//   twin   X held as the web fires: one web to each side of the street. The pivot is the midpoint, so the arc runs down
+//          the middle with no weave, steers slowly, slips through the air and leaves `rel` m/s faster.
+//   whip   a turn of more than ~55 deg held at the attach, at speed: the web turns his velocity into the new swing plane
+//          at `yaw` rad/s (the plane itself turns that fast too, not 1.7), he keeps the speed he came in with through
+//          the turn, and leaves `boost` faster.
+//   loop   Shift held past `from` rad of a rising arc, at speed, with the sky clear over the pivot: the rope shortens to
+//          `rope` m, the web carries him over the top and round, and he leaves the loop `boost` m/s faster.
+const SWX = (() => { try { return !new URLSearchParams(location.search).has('noswx'); } catch { return true; } })();
+const TWIN = { yaw: 0.6, drag: 0.5, latDamp: 3, motor: 1.15, top: 3, rel: 3 };
+const WHIP = { minV: 14, cos: 0.57, yaw: 2.9, dur: 1.3, done: 0.15, acc: 30, boost: 2 };
+const LOOP = { from: 1.05, to: 1.5, minV: 13, rope: 12, k: 2.0, acc: 60, boost: 6, maxT: 3.5, cd: 0.8 };
+// styles of the ordinary swing. `plunge` is the sid r2 swing with every value as it was, and the default.
+//   g: gravity while swinging (x GS: a heavier swing is a faster pendulum) · dip: SWING_DIP · pop: the timed release pop
+//   drag: air drag while swinging
+export const SWING_STYLES = [
+  { id: 'plunge', name: 'Deep plunge', g: 1, dip: SWING_DIP, pop: 1, drag: 1 },
+  { id: 'snappy', name: 'Short and snappy', g: 1.35, dip: 10, pop: 0.85, drag: 1 },
+  { id: 'floaty', name: 'Long and floaty', g: 0.78, dip: 32, pop: 1.2, drag: 0.7 },
+];
 const TRICK_DEF = {
   tuckFlip: { dur: 0.9, snap: 0.35, boost: 5.5, up: 0.8 },               // tucked front somersault (user r10c; replaces the flat dive-out)
   layout: { dur: 1.3, snap: 0.35, boost: 4.0, up: 2.5 },                 // loose layout flip (slow, eased): speed + a bit of height
@@ -96,6 +118,9 @@ export function createTraversal({ world, cam, web, rig, camera }) {
   const targeting = createZipTargeting(world, zipPoints);
   const anchors = createAnchorFinder(world, index, zipPoints);
   const rnd = Math.random;
+  let STY = SWING_STYLES[0]; // sid r5
+  const _lr = new THREE.Vector3(), _lt = new THREE.Vector3(), _lc = new THREE.Vector3(); // sid r5: the loop's own scratch vectors
+  try { const q = new URLSearchParams(location.search).get('swingstyle') ?? localStorage.getItem('spiderbench.swingStyle'); STY = SWING_STYLES.find(x => x.id === q) || STY; } catch { /* non-browser / private mode */ }
 
   const s = {
     mode: 'air', sub: 'fall', subT: 0, modeT: 0,
@@ -705,14 +730,18 @@ export function createTraversal({ world, cam, web, rig, camera }) {
     if (inD.lengthSq() > 0.1) { inD.normalize(); if (inD.dot(fwd) < 0.85) turn = inD; }
     const hs = Math.hypot(s.vel.x, s.vel.z);
     const fl = floorAt(s.pos.x, s.pos.z, feetY() + 0.1);
-    const a = anchors.find(s.pos, fwd, turn, s.vel.length(), fl);
+    // sid r5 twin: X held and the street offers a matched pair. Otherwise the ordinary search, as before
+    const pair = SWX && I.twin && !turn ? anchors.findPair(s.pos, fwd, s.vel.length(), fl) : null;
+    const a = pair ? { point: pair.left.point.clone().add(pair.right.point).multiplyScalar(0.5), normal: new THREE.Vector3(0, 1, 0), L: 0, lat: 0, kind: 'twin' }
+      : anchors.find(s.pos, fwd, turn, s.vel.length(), fl);
     if (!a) { events.push({ type: 'noAnchor' }); s.noAnchorT = (s.noAnchorT || 0) + 0.06; return false; }
     s.noAnchorT = 0;
-    startSwing(a, fwd, turn, hs); s.groundSwing = false;
+    startSwing(a, fwd, turn, hs, pair); s.groundSwing = false;
     return true;
   }
-  function startSwing(a, fwd, turn, hs) {
+  function startSwing(a, fwd, turn, hs, pair = null) {
     const S = s.swing;
+    S.twin = !!pair; S.whip = 0; S.loop = null; S.loopCd = 0; S.angU = null; // sid r5
     s.chain = (s.sinceSwing ?? 99) <= CHAIN_BUF ? Math.min(CHAIN_MAX, (s.chain || 0) + 1) : 0; // user r10g momentum chain
     events.push({ type: 'swingChain', n: s.chain });
     S.anchor.copy(a.point); S.normal.copy(a.normal); S.kind = a.kind;
@@ -720,7 +749,7 @@ export function createTraversal({ world, cam, web, rig, camera }) {
     // physics pivot: the real anchor with part of its lateral offset removed (keeps the arc in the travel plane; corner swings keep more)
     // (always fully in-plane: corner turns are done by steering the plane, never by a laterally offset pivot — an
     // offset pivot plus rope reel-in was the source of sideways position jumps)
-    const keep = SW2.keep; // sid r2: part of it is kept (the weave), capped at SW2.latMax m
+    const keep = pair ? 0 : SW2.keep; // sid r2: part of it is kept (the weave), capped at SW2.latMax m (sid r5 twin: none, the pivot is the midpoint)
     const dx = a.point.x - s.pos.x, dz = a.point.z - s.pos.z, along = dx * S.dir.x + dz * S.dir.z;
     let lx = dx - S.dir.x * along, lz = dz - S.dir.z * along;
     { const ll = Math.hypot(lx, lz) * keep; if (ll > SW2.latMax) { lx *= SW2.latMax / ll; lz *= SW2.latMax / ll; } }
@@ -734,7 +763,7 @@ export function createTraversal({ world, cam, web, rig, camera }) {
     let bottomFeet = a.kind === 'low' ? 3.0 : Math.max(fmax < 1 ? 4.2 : 2.6, clamp(4 + hEntry * 0.15, SW2.bottomMin, SW2.bottomMax)); // sid r2
     // user r10f: chained swings climb — the arc dips at most SWING_DIP below the entry, so every swing exits near its
     // entry height and the release pop (REL_UP) nets height each time (the street-dip look above still applies low down)
-    if (a.kind !== 'low') bottomFeet = Math.max(bottomFeet, hEntry - SWING_DIP);
+    if (a.kind !== 'low') bottomFeet = Math.max(bottomFeet, hEntry - STY.dip); // sid r5: the style's dip (plunge: SWING_DIP)
     S.ropeTarget = Math.max(4, Math.min(L, S.pivot.y - fmax - H - bottomFeet));
     // Arc depth without reel-in: if the rope from here would swing the feet below the clearance line, the (virtual)
     // physics pivot is raised instead (longer, flatter arc; the web is still drawn to the real anchor). Solves
@@ -767,7 +796,15 @@ export function createTraversal({ world, cam, web, rig, camera }) {
     const right = _v3.set(-S.dir.z, 0, S.dir.x);
     const lat = dx * right.x + dz * right.z;
     S.hand = Math.abs(lat) > 2 ? (lat > 0 ? 'R' : 'L') : (S.hand === 'R' ? 'L' : 'R');
-    web.attach(rig.handWorld(S.hand), S.anchor, S.normal);
+    if (pair) { // sid r5 twin: each hand's web goes to its own wall; S.anchor (what the pose and the pivot drift aim at) is the midpoint
+      S.hand = 'R';
+      web.attach(rig.handWorld('R'), pair.right.point, pair.right.normal);
+      web.attachSecond?.(rig.handWorld('L', new THREE.Vector3()), pair.left.point, pair.left.normal);
+      events.push({ type: 'swingTwin' });
+    } else web.attach(rig.handWorld(S.hand), S.anchor, S.normal);
+    // sid r5 whip: a hard turn held at the attach, at speed
+    // (measured against where he is GOING, not `fwd`: tryStartSwing has already bent that 60 % of the way to the stick)
+    if (SWX && !pair && turn && hs >= WHIP.minV && (turn.x * s.vel.x + turn.z * s.vel.z) / Math.max(Math.hypot(s.vel.x, s.vel.z), 1e-3) < WHIP.cos) { S.whip = WHIP.dur; S.whipV = Math.hypot(s.vel.x, s.vel.z); events.push({ type: 'cornerWhip', k: 0 }); }
     setMode('swing', 'swingLow'); s.trick = null; s.dive = false; s.airTrickUsed = false; s.airTapT = -9;
     events.push({ type: 'swingStart' });
   }
@@ -786,7 +823,8 @@ export function createTraversal({ world, cam, web, rig, camera }) {
       s.swingCooldown = 0.35; events.push({ type: 'swingJump' });
       return;
     }
-    s.vel.y -= GS * h;
+    const GSs = GS * STY.g; // sid r5: the style's swing gravity (plunge: GS)
+    s.vel.y -= GSs * h;
     const rd = _v.copy(S.pivot).sub(s.pos); const dist = rd.length(); rd.divideScalar(dist);
     // steering: input perpendicular to the rope; also bends the travel plane (corner swings)
     const inD = inputDir(I, new THREE.Vector3());
@@ -802,7 +840,8 @@ export function createTraversal({ world, cam, web, rig, camera }) {
       if (want) {
         const cur = Math.atan2(S.dir.x, S.dir.z), tgt = Math.atan2(want.x, want.z);
         const d = angWrap(tgt - cur);
-        if (Math.abs(d) < 2.6) dyaw = clamp(d, -1.7 * h, 1.7 * h) * clamp(Math.abs(d) / 0.25, 0, 1);
+        const yawMax = S.whip > 0 ? WHIP.yaw : S.twin ? TWIN.yaw : 1.7; // sid r5 (was 1.7 always)
+        if (Math.abs(d) < 2.6) dyaw = clamp(d, -yawMax * h, yawMax * h) * clamp(Math.abs(d) / 0.25, 0, 1);
         latIn = clamp(d / 0.8, -1, 1);
       }
       const avoid = facadeAvoid(h);
@@ -815,6 +854,20 @@ export function createTraversal({ world, cam, web, rig, camera }) {
         // the arc's heading turns; the drawn web stays on the real anchor
         const rel = _v3.copy(S.pivot).sub(s.pos); rel.applyQuaternion(_q); S.pivot.copy(s.pos).add(rel);
         sideA.set(-S.dir.z, 0, S.dir.x);
+      }
+    }
+    // sid r5 whip: the web hauls his VELOCITY round into the swing plane at WHIP.yaw, keeping its size. (Without this the
+    // part of his speed that is sideways to the new plane is not turned, it is damped away below: measured 30 m/s in,
+    // 3 to 11 m/s out of a 90 deg turn. Raising the plane's own turn rate alone changed nothing.) Over once he is
+    // travelling along the plane, or the time is up; he leaves a little faster.
+    if (S.whip > 0) {
+      S.whip -= h;
+      const hv = Math.hypot(s.vel.x, s.vel.z);
+      const d = hv > 1 ? angWrap(Math.atan2(S.dir.x, S.dir.z) - Math.atan2(s.vel.x, s.vel.z)) : 0;
+      if (hv > 1) { _q.setFromAxisAngle(UP, clamp(d, -WHIP.yaw * h, WHIP.yaw * h)); s.vel.applyQuaternion(_q); }
+      if (S.whip <= 0 || (Math.abs(d) < WHIP.done && S.t > 0.2)) {
+        S.whip = 0; if (hv > 1) { const k = (hv + WHIP.boost) / hv; s.vel.x *= k; s.vel.z *= k; }
+        events.push({ type: 'cornerWhip', k: 1 });
       }
     }
     // sid r3: the physics pivot drifts back under the drawn anchor (sideways only) over the swing, as Insomniac's did
@@ -835,7 +888,7 @@ export function createTraversal({ world, cam, web, rig, camera }) {
         for (const sg of [1, -1]) { const hh = world.raycast(s.pos, _v2.copy(sideA).multiplyScalar(sg), 2.5); if (hh && Math.abs(hh.normal.y) < 0.5) { S.sideN = (S.sideN || new THREE.Vector3()).set(hh.normal.x, 0, hh.normal.z).normalize(); S.sideK = 1 - hh.distance / 2.5; } } }
       if (S.sideN) { s.vel.addScaledVector(S.sideN, 10 * S.sideK * h); S.pivot.addScaledVector(S.sideN, 3 * S.sideK * h); } }
     // keep the pendulum in its plane: sideways velocity decays -> no drift into facades
-    { const vl = s.vel.dot(sideA); s.vel.addScaledVector(sideA, -vl * (1 - Math.exp(-SW2.latDamp * h))); } // sid r2: looser (the weave)
+    if (!(S.whip > 0)) { const vl = s.vel.dot(sideA); s.vel.addScaledVector(sideA, -vl * (1 - Math.exp(-(S.twin ? TWIN.latDamp : SW2.latDamp) * h))); } // sid r2: looser (the weave); sid r5 twin: tight
     corridor(h, inD);
     const spd = s.vel.length();
     // Insomniac "pump": ONLY with stick input along the swing direction while moving forward along the arc, strongest at
@@ -843,9 +896,9 @@ export function createTraversal({ world, cam, web, rig, camera }) {
     const tan = _v2.copy(s.vel).addScaledVector(rd, -s.vel.dot(rd));
     const push = inD.lengthSq() > 0.01 ? clamp(inD.dot(S.dir) / Math.max(inD.length(), 1e-3), 0, 1) : 0;
     if (push > 0 && tan.lengthSq() > 0.01 && tan.dot(S.dir) > 0 && S.tautT > 0) {
-      const E = 0.5 * spd * spd + GS * (s.pos.y - S.pivot.y);           // specific energy relative to the pivot
-      const Ecap = -GS * S.rope * Math.cos(PUMP_MAX_ANG);               // energy that just reaches PUMP_MAX_ANG
-      const room = clamp((Ecap - E) / (GS * 1.5), 0, 1);
+      const E = 0.5 * spd * spd + GSs * (s.pos.y - S.pivot.y);           // specific energy relative to the pivot
+      const Ecap = -GSs * S.rope * Math.cos(PUMP_MAX_ANG);               // energy that just reaches PUMP_MAX_ANG
+      const room = clamp((Ecap - E) / (GSs * 1.5), 0, 1);
       const bottom = Math.max(0, rd.y);
       s.vel.addScaledVector(tan.normalize(), 9 * bottom * bottom * push * room * h);
     }
@@ -866,14 +919,37 @@ export function createTraversal({ world, cam, web, rig, camera }) {
         const vt = s.vel.dot(tg);
         if (vt > -1.5) {
           const u = clamp((ang - 0.15) / 0.85, 0, 1);
-          const vmin = clamp(0.65 * Math.sqrt(GS * S.rope), 10, 18) * u * u * (3 - 2 * u);
+          const vmin = clamp(0.65 * Math.sqrt(GSs * S.rope), 10, 18) * u * u * (3 - 2 * u) * (S.twin ? TWIN.motor : 1); // sid r5 twin: two webs pull harder
           if (vt < vmin) s.vel.addScaledVector(tg, Math.min(vmin - vt, 30 * h));
         }
       }
     }
     // aerodynamic drag (quadratic): a held swing with no input settles into a decaying pendulum within a few passes
-    s.vel.multiplyScalar(Math.max(0, 1 - SWING_DRAG * (1 - 0.08 * (s.chain || 0)) * spd * h)); // a momentum chain slips through the air (r10g)
-    if (spd > 37 + 3 * (s.chain || 0)) s.vel.multiplyScalar(1 - 0.3 * h); // soft top speed (hard cap VMAX; dives exceed it); a swing chain lifts it (r10g)
+    s.vel.multiplyScalar(Math.max(0, 1 - SWING_DRAG * STY.drag * (S.twin ? TWIN.drag : 1) * (1 - 0.08 * (s.chain || 0)) * spd * h)); // a momentum chain slips through the air (r10g)
+    // sid r5 whip: the turn costs no speed (the web hauls him round at the speed he came in with)
+    if (S.whip > 0) { const hv = Math.hypot(s.vel.x, s.vel.z); if (hv > 1 && hv < S.whipV) { const k = Math.min(S.whipV, hv + WHIP.acc * h) / hv; s.vel.x *= k; s.vel.z *= k; } }
+    // sid r5 loop: Shift held on the way up, fast, sky clear over the pivot -> the web takes him over the top. While it
+    // runs, the web keeps the speed a taut loop of this rope needs (v^2 = k g L), so it never goes slack at the top.
+    if (SWX && S.angU != null) {
+      // tangent of the circle he is on, from the velocity as it stands now
+      _lr.copy(S.pivot).sub(s.pos).normalize(); _lt.copy(s.vel).addScaledVector(_lr, -s.vel.dot(_lr));
+      const tl = _lt.lengthSq() > 1e-4 ? _lt.normalize() : null;
+      if (!S.loop && S.loopCd <= 0 && I.reel > 0 && S.tautT > 0.2 && S.angle > LOOP.from && S.angle < LOOP.to && s.vel.y > 0 && tl && tl.dot(S.dir) > 0 && spd > LOOP.minV && loopClear()) {
+        S.loop = { a0: S.angU, t: 0 }; S.ropeTarget = Math.min(S.ropeTarget, LOOP.rope); events.push({ type: 'swingLoop', k: 0 });
+      }
+      if (S.loop) {
+        S.loop.t += h; S.ropeTarget = Math.min(S.ropeTarget, LOOP.rope);
+        const need = Math.sqrt(LOOP.k * GSs * Math.max(S.rope, 4));
+        if (tl) { const vt = s.vel.dot(tl); if (vt < need) s.vel.addScaledVector(tl, Math.min(need - vt, LOOP.acc * h)); }
+        if (S.angU >= 2 * Math.PI - 0.25) { // round and back at the bottom, travelling forward again
+          if (tl) s.vel.addScaledVector(tl, LOOP.boost);
+          s.chain = Math.min(CHAIN_MAX, (s.chain || 0) + 1);
+          S.loop = null; S.loopCd = LOOP.cd; S.angU -= 2 * Math.PI; events.push({ type: 'swingLoop', k: 1 });
+        } else if (S.loop.t > LOOP.maxT) { S.loop = null; S.loopCd = LOOP.cd; }
+      }
+      S.loopCd -= h;
+    }
+    if (spd > 37 + 3 * (s.chain || 0) + (S.twin ? TWIN.top : 0)) s.vel.multiplyScalar(1 - 0.3 * h); // soft top speed (hard cap VMAX; dives exceed it); a swing chain lifts it (r10g)
     // reel toward target length (lifts off the street), faster if the feet approach the floor
     const fl = floorAt(s.pos.x, s.pos.z, feetY() + 0.2);
     const clearance = feetY() - fl;
@@ -904,7 +980,7 @@ export function createTraversal({ world, cam, web, rig, camera }) {
     if (L > S.rope) {
       d.divideScalar(L); s.pos.copy(S.pivot).addScaledVector(d, S.rope);
       const vr = s.vel.dot(d) - pay / h; if (vr > 0) { s.vel.addScaledVector(d, -vr); vrIn = vr; }
-      const vt2 = s.vel.lengthSq(); tension = clamp((vt2 / Math.max(S.rope, 1) + GS * Math.max(0, -d.y)) / (GS * 2.6), 0, 1);
+      const vt2 = s.vel.lengthSq(); tension = clamp((vt2 / Math.max(S.rope, 1) + GSs * Math.max(0, -d.y)) / (GSs * 2.6), 0, 1);
     }
     if (pay > 0 && !tension) tension = S.tension; // (a web paying out is carrying him: it reads as taut as it was)
     // slack: over the top (angle > 90 deg without enough speed for v^2/r > g) the body free-falls inside the circle; the
@@ -912,8 +988,8 @@ export function createTraversal({ world, cam, web, rig, camera }) {
     // physical criterion: required rope pull = v_t^2/L - g.(outward); < 0 means gravity out-pulls the circle -> free fall
     const du = _v4.copy(s.pos).sub(S.pivot).divideScalar(Math.max(L, 1e-3));
     const vtan2 = s.vel.lengthSq() - s.vel.dot(du) ** 2;
-    const need = vtan2 / Math.max(L, 1) - GS * du.y;
-    const slackT = tension < 0.05 ? Math.max(clamp(-need / (GS * 0.35), 0, 1), clamp((S.rope - L) / 1.0, 0, 1)) : 0;
+    const need = vtan2 / Math.max(L, 1) - GSs * du.y;
+    const slackT = tension < 0.05 ? Math.max(clamp(-need / (GSs * 0.35), 0, 1), clamp((S.rope - L) / 1.0, 0, 1)) : 0;
     if (slackT > 0.2) S.slackT += h;
     else if (tension > 0.05) {
       if (S.slackT > 0.18 && vrIn > 2) { tension = 1; events.push({ type: 'ropeSnap', severity: clamp(vrIn / 14, 0.15, 1) }); }
@@ -951,6 +1027,7 @@ export function createTraversal({ world, cam, web, rig, camera }) {
     const f2 = floorAt(s.pos.x, s.pos.z, feetY() + 0.4);
     if (feetY() < f2 + 0.3) { s.pos.y = f2 + 0.3 + H; if (s.vel.y < 0) s.vel.y = 0; }
     // phase / sub-state
+    { const a1 = swingAngle(); S.angU = S.angU == null ? a1 : S.angU + angWrap(a1 - S.angle); } // sid r5: the angle unwrapped (a loop counts 2 pi)
     S.phase = swingPhase(); S.angle = swingAngle(); if (S.ang0 == null) S.ang0 = S.angle;
     S.angMax = Math.max(S.angMax ?? -9, S.angle);
     if (!S.apexed && (S.angle < S.angMax - 0.06 && S.angMax > 0.2 || S.t > 4)) S.apexed = true;
@@ -959,7 +1036,15 @@ export function createTraversal({ world, cam, web, rig, camera }) {
     else setSub(S.phase < -0.28 ? 'swingLow' : S.phase < 0.28 ? 'swingBottom' : 'swingHigh');
     web.setSlack?.(S.slack, S.tension);
     // NO auto-release: while the button is held he keeps swinging — up past the anchor, over and around (pure rope physics)
-    ropeWrap(h);
+    if (!S.twin) ropeWrap(h); // sid r5 twin: its anchor is the midpoint in the air between two webs, nothing to wrap round
+  }
+  // sid r5 loop: nothing solid within reach of a LOOP.rope circle over and behind the pivot, in the swing plane
+  function loopClear() {
+    const S = s.swing, r = LOOP.rope + 1.6;
+    for (const [f, u] of [[0, 1], [-0.707, 0.707], [-1, 0], [0.707, 0.707]]) {
+      if (world.raycast(S.pivot, _lc.set(S.dir.x * f, u, S.dir.z * f), r)) return false;
+    }
+    return true;
   }
   // Rope wrap: if a building now sits between the body and the anchor (the rope would pass THROUGH it — physically
   // impossible) the web wraps on that edge: the contact point becomes the new anchor/pivot with the remaining length.
@@ -1064,7 +1149,8 @@ export function createTraversal({ world, cam, web, rig, camera }) {
     s.lastSwingComp = +comp.toFixed(2); s.lastBoost = +fb.toFixed(2);
     if (fb > 0) { s.vel.x += hv.x * FULL_SWING_FWD * fb; s.vel.z += hv.z * FULL_SWING_FWD * fb; events.push({ type: 'swingBoost', k: fb, comp }); }
     // sid r2 timing on the release pop (ku) + upstream's full-swing boost (upB): both apply
-    if (kind !== 'jump') { const ku = k * timing; s.vel.y = Math.min(Math.max(s.vel.y, REL_UP_VY + upB), Math.max(s.vel.y + REL_UP * ku + upB, (REL_UP * 0.75 * ku) + upB)); }
+    if (s.swing.twin) { s.vel.x += hv.x * TWIN.rel; s.vel.z += hv.z * TWIN.rel; } // sid r5 twin: both webs let go at once
+    if (kind !== 'jump') { const ku = k * timing * STY.pop; s.vel.y = Math.min(Math.max(s.vel.y, REL_UP_VY + upB), Math.max(s.vel.y + REL_UP * ku + upB, (REL_UP * 0.75 * ku) + upB)); }
     if (kind === 'jump') { // user r11: Space-release = stronger forward push + a jump-off-the-web pop up
       s.vel.x += hv.x * SWING_JUMP * k; s.vel.z += hv.z * SWING_JUMP * k;
       s.vel.y = Math.min(SWING_JUMP_VY + upB, Math.max(s.vel.y + SWING_JUMP_UP + upB, SWING_JUMP_UP * 0.85 + upB));
@@ -2077,6 +2163,13 @@ export function createTraversal({ world, cam, web, rig, camera }) {
   const guardP = new THREE.Vector3(); let guardOk = false;
   const api = {
     s, anim, events, targeting, zipPoints, anchors, index, rootPos,
+    // sid r5: the style of the ordinary swing (SWING_STYLES). setSwingStyle(id) or no argument for the next one; kept in localStorage
+    get swingStyle() { return STY; },
+    setSwingStyle(id) {
+      STY = SWING_STYLES.find(x => x.id === id) || SWING_STYLES[(SWING_STYLES.indexOf(STY) + 1) % SWING_STYLES.length];
+      try { localStorage.setItem('spiderbench.swingStyle', STY.id); } catch { /* private mode */ }
+      return STY;
+    },
     H, R,
     floorAt,
     update(dt, I) {
