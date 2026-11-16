@@ -21,6 +21,8 @@ export function createSettingsPage(sys) {
     if (cat === 'graphics') main.innerHTML = `<div class="sys-h3">Graphics</div>
       ${seg('quality', [['low', 'Low'], ['med', 'Medium'], ['high', 'High']], 'Quality Preset', `Shadows, AO, clouds, DoF samples. Applying reloads the game (current: ${curQ}).`)}
       ${range('renderScale', 0.6, 1.25, 0.05, 'Render Resolution', 'Internal resolution scale. Lower for more FPS.', FMT.renderScale)}
+      ${seg('dynRes', [['0', 'Off'], ['30', '30 FPS'], ['60', '60 FPS']], 'Dynamic Resolution', 'Lowers the render resolution while frames run slower than this, and raises it again when they recover')}
+      ${seg('cityLights', [['true', 'On'], ['false', 'Off']], 'City Lights', 'Street lamps, shop fronts and car lights that really light the street at night. Off roughly halves the cost of a night frame')}
       ${seg('timeOfDay', [['day', 'Day'], ['morning', 'Morning'], ['sunrise', 'Sunrise'], ['sunset', 'Sunset'], ['dusk', 'Dusk'], ['night', 'Night'], ['overcast', 'Overcast']], 'Time of Day', 'Hand-tuned lighting preset')}
       ${seg('daySun', [['a', 'Midday'], ['b', 'Late Morning'], ['c', 'Afternoon']], 'Day Sun', 'Sun direction for the Day preset (shadow angle)')}
       ${seg('puddles', [['true', 'On'], ['false', 'Off']], 'Puddles', 'Water and wet patches on the ground in dry weather (rain always wets the streets)')}`; // (lighting2 r3) fixed presets (no cycle)

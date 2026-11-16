@@ -13,6 +13,8 @@ export const DEFAULT_SETTINGS = {
   timeOfDay: 'day', // (lighting2 r3) fixed preset: day | morning | sunrise | sunset | dusk | night | overcast
   puddles: true, // (user r-nopuddles) water / wet patches on the ground in dry weather (rain always wets the streets)
   daySun: 'a', // (user r-daysun) Day preset sun direction: a (midday, SSW) | b (late morning, SE) | c (afternoon, WSW)
+  dynRes: 30, // (sid r6) dynamic resolution: 0 off | the frame rate it holds (30 | 60) by lowering the render scale
+  cityLights: true, // (sid r6) upstream's real local lights at night (render/citylights.js); false = the night as it was before them
 };
 
 export function defaultState() {

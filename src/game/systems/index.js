@@ -80,15 +80,40 @@ export function initSystems(ctx) {
   if (pipe.setAperture) { const o = pipe.setAperture.bind(pipe); pipe.setAperture = a => o(flow.mode === 'photo' ? a : a * (save.state.settings.dof ?? 1)); }
   if (pipe.setDof) { const o = pipe.setDof.bind(pipe); pipe.setDof = (d = {}) => o(d.aperture !== undefined && flow.mode !== 'photo' ? { ...d, aperture: d.aperture * (save.state.settings.dof ?? 1) } : d); }
   let appliedScale = null;
+  // (sid r6) Dynamic resolution: Settings > Graphics > Dynamic Resolution names a frame rate; while play runs slower the
+  // render scale steps down (x0.85 a step, to 0.6 of the Render Resolution setting at the lowest), and back up when
+  // there is room. Measured 2026-11-16: about half of a 1080p frame is pixel work by day, more at night. A step
+  // reallocates the pipeline's render targets, so steps are at least 2.5 s apart (6 s before stepping back up), and
+  // the frame time is an average that ignores single long frames. Off in ?shot / ?playtest (not persistent) and in menus.
+  // It steps back up only if the SLOWEST the average got since the last step still leaves room (frame times here come in
+  // bursts of short and long frames, and an average that dipped for a moment had it stepping up and down every 6 s).
+  const dyn = { k: 1, avg: 0, worst: 0, t: 0, min: 0.6 };
+  let dynLast = 0;
+  const dynTick = () => {
+    const now = performance.now(), realDt = dynLast ? (now - dynLast) / 1000 : 0; dynLast = now; // the real frame time (ctx.realDt is capped at 50 ms)
+    const fps = save.state.settings.dynRes;
+    if (!(fps > 0) || !save.persistent || flow.mode !== 'play' || !(realDt > 0)) return;
+    dyn.avg = dyn.avg ? dyn.avg + (Math.min(realDt, 0.1) - dyn.avg) * 0.03 : realDt; dyn.t += realDt;
+    if (dyn.t > 1.5) dyn.worst = Math.max(dyn.worst, dyn.avg); // (the first 1.5 s after a step still average the old size)
+    const target = 1 / fps;
+    let k = dyn.k;
+    if (dyn.avg > target * 1.12 && dyn.t > 2.5 && k > dyn.min) k = Math.max(dyn.min, k * 0.85);
+    else if (dyn.worst > 0 && dyn.worst < target * 0.74 && dyn.t > 6 && k < 1) k = Math.min(1, k / 0.85);
+    if (k !== dyn.k) { dyn.k = k; dyn.t = 0; dyn.worst = 0; sys.applySettings(); }
+  };
+  sys.dynRes = dyn;
   sys.applySettings = () => {
     const s = save.state.settings;
     audio.setVolumes(s);
     { const t = s.timeOfDay === 'cycle' || !s.timeOfDay ? 'day' : s.timeOfDay; ctx.lighting?.setTimeMode?.(t === 'day' ? ({ b: 'dayB', c: 'dayC' }[s.daySun] ?? 'day') : t); } // (user r-daysun) Day Sun variant // (lighting2 r3) fixed preset (old saves: 'cycle' -> day)
     ctx.lighting?.setDryPuddles?.(s.puddles !== false); // (user r-nopuddles)
-    if (s.renderScale !== appliedScale) {
-      appliedScale = s.renderScale;
+    // (sid r6) city lights on / off. ?nocl still wins (A/B). Off compiles the block out of the lit materials (render/citylights.js)
+    if (!q.has('nocl') && window.__cityLights) window.__cityLights.enabled = s.cityLights !== false;
+    if (!(s.dynRes > 0)) dyn.k = 1;
+    if (s.renderScale * dyn.k !== appliedScale) { // (sid r6) x the dynamic-resolution factor
+      appliedScale = s.renderScale * dyn.k;
       if (appliedScale !== 1 || ctx.renderer.getPixelRatio() !== Math.min(devicePixelRatio, 1.5)) {
-        ctx.renderer.setPixelRatio(Math.min(devicePixelRatio, 1.5) * s.renderScale);
+        ctx.renderer.setPixelRatio(Math.min(devicePixelRatio, 1.5) * appliedScale);
         ctx.renderer.setSize(innerWidth, innerHeight); ctx.pipeline.setSize?.(innerWidth, innerHeight);
       }
     }
@@ -289,6 +314,7 @@ export function initSystems(ctx) {
     name: 'openworld',
     update(dt) {
       time += dt;
+      dynTick(); // (sid r6)
       const playing = flow.isPlaying;
       const p = ctx.player.position;
       sys.suits.update(dt);

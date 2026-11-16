@@ -23,6 +23,35 @@ const UPLOAD_MAT = new THREE.MeshBasicMaterial({ colorWrite: false, depthWrite: 
 
 const sig = (g) => Object.keys(g.attributes).sort().map(k => k + g.attributes[k].itemSize + (g.attributes[k].normalized ? 'n' : '') + g.attributes[k].array.constructor.name).join(',') + (g.index ? '|i' : '');
 
+// (sid r4) The CPU copy of a tile's vertex data is dropped once the GPU has it. Measured 2026-11-16: the scene held
+// 2.9 GB of typed arrays after upload ('roofs' 1.2 GB, 'detail' 0.9 GB, 'facade' 0.3 GB), all of it also in GPU buffers.
+// Nothing reads these arrays after the build (collision is world/collision.js Solids, not the meshes; three reads an
+// uploaded array only for wireframe). Bounds are computed first, because csm.js asks for them lazily; a geometry wider
+// than 500 m keeps its positions, which csm.js splits into 256 m cells. A lost WebGL context cannot be restored from
+// these buffers (the game reloads for that anyway). ?keepgeo = old behaviour (A/B)
+const KEEPGEO = Q.has('keepgeo');
+function dropArray() { this.array = null; }
+function freeOnUpload(g) {
+  if (KEEPGEO) return;
+  if (!g.boundingSphere) g.computeBoundingSphere();
+  if (!g.boundingBox) g.computeBoundingBox();
+  const b = g.boundingBox, wide = b.max.x - b.min.x > 500 || b.max.z - b.min.z > 500;
+  for (const [k, a] of Object.entries(g.attributes)) if (!(wide && k === 'position')) a.onUpload(dropArray);
+  if (g.index) g.index.onUpload(dropArray);
+}
+
+// (sid r6) Tile normals are stored as 4 signed bytes (normalised), not 3 floats: 4 bytes a vertex instead of 12, in
+// memory and on the GPU. Measured 2026-11-16: the batched tiles hold 36 M vertices, so 290 MB less. Box faces (0 and
+// +-1) are exact; anything else is within 0.45 degrees. The shaders still read a vec3. ?fatnormals = floats (A/B)
+const FATNORMALS = Q.has('fatnormals');
+function packNormals(g) {
+  const a = g.attributes.normal;
+  if (FATNORMALS || !a || !(a.array instanceof Float32Array) || a.itemSize !== 3) return;
+  const src = a.array, n = a.count, dst = new Int8Array(n * 4);
+  for (let i = 0, j = 0, k = 0; i < n; i++, j += 3, k += 4) { dst[k] = Math.round(src[j] * 127); dst[k + 1] = Math.round(src[j + 1] * 127); dst[k + 2] = Math.round(src[j + 2] * 127); }
+  g.setAttribute('normal', new THREE.BufferAttribute(dst, 4, true));
+}
+
 function mk(g, material, name, o) {
   const m = new THREE.Mesh(g, material); m.name = name;
   m.castShadow = !!o.castShadow; m.receiveShadow = !!o.receiveShadow;
@@ -48,6 +77,7 @@ export function batchTiles(geoms, material, name, o = {}, centers = []) {
     const grp = { tiles: idx, sup: null, nVis: 0 };
     if (idx.length === 1) { // nothing to merge: the tile keeps its own geometry
       const i = idx[0], m = mk(geoms[i], material, name + ' ' + i, o);
+      packNormals(geoms[i]); freeOnUpload(geoms[i]);
       tile[i] = { m, grp, vis: true, sh: true }; meshes.push(m); geoms[i] = null;
       grp.nVis = 1; groups.push(grp); continue;
     }
@@ -74,6 +104,7 @@ export function batchTiles(geoms, material, name, o = {}, centers = []) {
     }
     const IA = new THREE.BufferAttribute(I, 1);
     G.setIndex(IA); G.computeBoundingSphere(); G.computeBoundingBox();
+    packNormals(G); freeOnUpload(G); // the tiles below share these attributes
     const sup = mk(G, material, name + ' super', o); sup.visible = false; meshes.push(sup);
     grp.sup = sup;
     idx.forEach((i, k) => { // the tile: same buffers, its own index range + bounds
@@ -103,6 +134,7 @@ export function batchTiles(geoms, material, name, o = {}, centers = []) {
   // helper mesh (empty draw range: three uploads a geometry's attributes when it projects a visible mesh; the GL buffer
   // is cached per BufferAttribute, so the real tile reuses it). Returns false once everything is uploaded.
   const upG = new THREE.BufferGeometry(); upG.setDrawRange(0, 0);
+  upG.boundingSphere = new THREE.Sphere(); // (sid r4) three sorts by it; computing it would read an array freeOnUpload dropped
   const upM = new THREE.Mesh(upG, UPLOAD_MAT); upM.name = name + ' upload'; upM.frustumCulled = false; upM.visible = false;
   meshes.push(upM);
   const endWarm = () => { upM.visible = false; };
@@ -113,7 +145,10 @@ export function batchTiles(geoms, material, name, o = {}, centers = []) {
       const g = t.m.geometry;
       if (!t.wq) t.wq = [...Object.keys(g.attributes), g.index ? '#index' : null].filter(Boolean);
       if (!t.wq.length) return false;
-      const k = t.wq.shift();
+      let k = t.wq.shift();
+      // (sid r4) already on the GPU (uploaded by a visible tile sharing the buffer): nothing to pre-upload
+      while (k && !(k === '#index' ? g.index : g.attributes[k]).array) k = t.wq.shift();
+      if (!k) return false;
       for (const n of Object.keys(upG.attributes)) upG.deleteAttribute(n);
       upG.setIndex(null);
       if (k === '#index') { upG.setAttribute('position', g.attributes.position); upG.setIndex(g.index); }

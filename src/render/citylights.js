@@ -61,7 +61,7 @@ export const cityLightsShared = { data: dataTex, grid: gridTex, origin: new THRE
 const GLSL_PARS = /* glsl */`
 // (r11) fallbacks set per material by fixPrograms() on GPUs with 16 fragment texture units (Apple / ANGLE D3D11):
 // CITYL_NOSH drops the shadow-map sampler, CITYL_OFF the city lights entirely (the program would not link)
-#ifdef CITYL_OFF
+#if defined( CITYL_OFF ) || defined( CITYL_DAY ) // (sid r4) CITYL_DAY: set on every lit material while no city light is on (syncDayDefine)
 #undef USE_CITYL
 #endif
 // (r13) CITYL_UNIF: no city-light textures at all: the CL_UN lights that light the player most arrive as a uniform array
@@ -339,6 +339,28 @@ function fixPrograms() {
     }
   });
 }
+// (sid r4) By day the city-light block is compiled OUT of every lit built-in material (define CITYL_DAY), not skipped on
+// the cityL.origin.w uniform branch. Measured 2026-11-16 (Apple M5, ANGLE Metal, 1920x1080, still camera at the spawn,
+// 'day'): 54-68 ms a frame with the block compiled in and branched over, 43 ms with it compiled out, the same as before
+// the city lights existed (43 ms at d64a861). The define follows nightK across the same 0.01 threshold build() uses, so
+// the lights look exactly as before whenever they are on. Changing to or from a night preset recompiles the lit
+// materials once (three keeps both variants afterwards). Materials that join the scene later are picked up within 120
+// frames. Custom ShaderMaterials are left alone. ?clalways = old behaviour (A/B)
+const CL_ALWAYS = /[?&]clalways\b/.test(globalThis.location?.search ?? '');
+const _lit = m => m.isMeshStandardMaterial || m.isMeshLambertMaterial || m.isMeshPhongMaterial || m.isMeshToonMaterial;
+let _dayDef = null, _dayScan = 0;
+function syncDayDefine(off) {
+  if (CL_ALWAYS || !_scn || (off === _dayDef && ++_dayScan % 120)) return;
+  _dayDef = off;
+  _scn.traverse(o => {
+    for (const m of Array.isArray(o.material) ? o.material : o.material ? [o.material] : []) {
+      if (!_lit(m) || !!(m.defines && 'CITYL_DAY' in m.defines) === off) continue;
+      if (off) (m.defines || (m.defines = {})).CITYL_DAY = ''; else delete m.defines.CITYL_DAY;
+      m.needsUpdate = true;
+    }
+  });
+}
+
 let _installed = false;
 export function installCityLightChunks(renderer = null, scene = null) {
   _rnd = renderer; _scn = scene;
@@ -544,6 +566,7 @@ function build(camera) {
   if (_rnd) fixPrograms();
   const S = cityLightsShared, k = nightK.value;
   updateAmbient(k);
+  syncDayDefine(!cityLights.enabled || k < 0.01); // (sid r4)
   if (!cityLights.enabled || k < 0.01) { S.origin.w = 0; cityLights.stats.lights = 0; return; }
   camera.getWorldDirection(_cd);
   sinceFull++;
