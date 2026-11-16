@@ -20,6 +20,7 @@
 // Geometry is merged per material over all bridges: stone, deck, cables, steel (vertex colours: one draw for every
 // bridge), truss / railings (lattice shader) = 5 draw calls.
 import { nightK, nightOnly } from '../render/daynight.js'; // (daynight)
+import { cityLights } from '../render/citylights.js'; // (night) real deck-lamp lighting
 import * as THREE from 'three';
 import { G, BRIDGES, shoreX, onRoad, streetsAt, addCurbCut } from './layout.js';
 import { FAR_LANDS, FAR_Y } from './farshore.js';
@@ -163,15 +164,25 @@ function cableMaterial() {
   const m = new THREE.MeshStandardMaterial({ color: 0x3b4043, roughness: 0.6, metalness: 0.35 });
   m.onBeforeCompile = (sh) => {
     sh.uniforms.uNightK = nightK; // (daynight) necklace lights along the cables at night
-    sh.vertexShader = sh.vertexShader.replace('#include <common>', '#include <common>\nattribute vec3 aEx; varying vec3 vWPc; varying float vNeck;').replace('#include <begin_vertex>', `#include <begin_vertex>
-      vNeck = aEx.x; { vec3 wp = (modelMatrix * vec4(transformed, 1.0)).xyz; transformed += objectNormal * max(0.0, length(wp - cameraPosition) * 0.0011 - 0.15); vWPc = wp; }`);
-    sh.fragmentShader = sh.fragmentShader.replace('#include <common>', '#include <common>\nvarying vec3 vWPc; varying float vNeck; uniform float uNightK;')
+    sh.vertexShader = sh.vertexShader.replace('#include <common>', '#include <common>\nattribute vec3 aEx; varying vec3 vWPc; varying float vNeck, vFat;').replace('#include <begin_vertex>', `#include <begin_vertex>
+      vNeck = aEx.x; { vec3 wp = (modelMatrix * vec4(transformed, 1.0)).xyz; vFat = max(0.0, length(wp - cameraPosition) * 0.0011 - 0.15); transformed += objectNormal * vFat; vWPc = wp; }`);
+    sh.fragmentShader = sh.fragmentShader.replace('#include <common>', '#include <common>\nvarying vec3 vWPc; varying float vNeck, vFat; uniform float uNightK;')
+      // (night) the distance-fattened cables read as pale bars against the night sky (moon / sky sheen on 2+ px tubes):
+      // darker, less metallic at night, so only the necklace bulbs carry the catenaries from afar
+      .replace('#include <metalnessmap_fragment>', '#include <metalnessmap_fragment>\nmetalnessFactor *= 1.0 - 0.85 * uNightK; diffuseColor.rgb *= 1.0 - 0.7 * uNightK;')
       .replace('#include <emissivemap_fragment>', `#include <emissivemap_fragment>
       if (uNightK > 0.0 && vNeck > 0.5) { float q = (vWPc.x + vWPc.z) * 0.18; float fq = fwidth(q) + 1e-4;
-        float dot1 = mix(smoothstep(0.12, 0.04, abs(fract(q) - 0.5)), 0.16, clamp(fq * 2.0, 0.0, 1.0));
-        totalEmissiveRadiance += vec3(1.0, 0.93, 0.78) * dot1 * 5.0 * uNightK; }`);
+        // (night) small bright bulbs, not a glowing bar: each bulb stays >= ~1.5 px long at any distance (never averaged
+        // into a continuous line); once bulbs crowd to < ~3.5 px apart only every 2nd / 4th / ... bulb is drawn (stable
+        // world-space subset), so far bridges keep a dotted necklace of points. Bloom does the glow
+        float st = exp2(ceil(log2(max(1.0, fq * 6.0)))); // (night r11) 3.5: far necklaces read as dashed white bars
+        float hw = max(0.05, fq * 0.75), dd = abs(fract(q) - 0.5);
+        float dot1 = (1.0 - smoothstep(hw - 0.5 * fq, hw + 0.5 * fq, dd)) * step(mod(floor(q), st), 0.5);
+        // (night r11) the cable is fattened with distance (~1.5 m at 1.5 km): the bulb's emission is scaled back by the
+        // fattening, so far necklaces read as fine warm points instead of thick white dashes (esb view)
+        totalEmissiveRadiance += vec3(1.0, 0.9, 0.72) * dot1 * 3.5 * uNightK / (1.0 + vFat * 6.0); }`);
   };
-  m.customProgramCacheKey = () => 'bridge-cable-minpx-v3';
+  m.customProgramCacheKey = () => 'bridge-cable-minpx-v6';
   return m;
 }
 // lattice (vertex colours). uv.y 0..1: truss web (u = along in panels): chords, posts every panel, X diagonals.
@@ -380,7 +391,7 @@ export function bridgeLimits(groundHeight) {
 export function buildBridges({ scene, T, solids = null, zips = null, boxes = null }) {
   const group = new THREE.Group(); group.name = 'bridges';
   scene.add(group);
-  const K = { stone: new Acc(), deck: new Acc(), cable: new Acc(), steel: new Acc(), lat: new Acc(), pool: new Acc(), solids, zips, boxes };
+  const K = { stone: new Acc(), deck: new Acc(), cable: new Acc(), steel: new Acc(), lat: new Acc(), pool: new Acc(), lamps: [], solids, zips, boxes }; // (night) lamps: real lights (citylights.js)
   const spans = bridgeSpans();
   for (const B of spans) {
     const col = new THREE.Color(B.color ?? 0x6f7a80);
@@ -411,7 +422,12 @@ export function buildBridges({ scene, T, solids = null, zips = null, boxes = nul
       blendSrc: THREE.SrcAlphaFactor, blendDst: THREE.OneFactor, blendSrcAlpha: THREE.ZeroFactor, blendDstAlpha: THREE.OneFactor,
       depthWrite: false, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2, fog: false });
     const g = K.pool.build();
-    if (g) { const m = new THREE.Mesh(g, pm); m.name = 'bridgeLampPools'; m.renderOrder = 2; m.onBeforeRender = () => { pm.opacity = nightK.value; }; group.add(nightOnly(m)); }
+    if (g) { const m = new THREE.Mesh(g, pm); m.name = 'bridgeLampPools'; m.renderOrder = 2; m.onBeforeRender = () => { pm.opacity = cityLights.enabled ? 0 : nightK.value; }; group.add(nightOnly(m)); } // (night) replaced by the real lamp light below
+    // (night) every deck lamp is a real light: roadway cobra heads = warm down-facing spots (like the street lamps,
+    // props.js), anchorage twin globes = soft warm points
+    for (const L of K.lamps) cityLights.add(L.globe
+      ? { type: 'point', pos: [L.x, L.y, L.z], color: 0xffd9a8, intensity: 55, range: 14, radius: 0.5, volume: 0.45 }
+      : { type: 'spot', pos: [L.x, L.y, L.z], dir: [0, -1, 0], angle: 1.3, penumbra: 0.8, color: 0xffdab4, intensity: 82, range: 17, radius: 0.9, volume: 0.4 }); // (night r3) same warm-white head as the street lamps
   }
   return { group, spans };
 }
@@ -611,6 +627,7 @@ function roadwayLamps(B, K, xa, xb, yAt) {
     K.solids?.box(x - 0.45, yt - 0.02, hz - 0.25, x + 0.45, yt + 0.3, hz + 0.25, 'pole');
     if (yt - yAt(x) > 6) K.zips?.add(x, yt + 0.3, hz, 0, 1, 0, 'lampTop');
     lampPool(K, x, yAt(x), hz, 5.2, yAt(x + 1) - yAt(x)); // (bridges r2)
+    K.lamps?.push({ x, y: yt - 0.1, z: hz }); // (night)
   }
   K.steel.col = steelCol;
 }
@@ -697,6 +714,7 @@ function anchorLamps(B, K, a0, a1, y0, lz) {
     K.steel.ex = [0, 0, 0];
     K.solids?.box(x - 0.35, y0, zp - 0.35, x + 0.35, yt, zp + 0.35, 'pole');
     lampPool(K, x, y0 - 0.44, zp - s * 1.2, 4.2);
+    K.lamps?.push({ x, y: yt + 0.3, z: zp, globe: true }); // (night) one light for the twin globes
   }
   K.steel.col = col;
 }

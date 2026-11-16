@@ -294,7 +294,7 @@ export class Enemy {
         const gy = this.ground();
         if (this.pos.y <= gy && this.vel.y <= 0) {
           this.pos.y = gy; const sev = clamp(-this.vel.y / 16, 0.2, 1);
-          c.fx.dust(this.pos, { amount: 0.5 + sev }); c.shake(0.12 * sev + 0.05); c.sfx('land', 0.4 + sev * 0.5);
+          c.fx.dust(this.pos, { amount: 0.5 + sev }); c.shake(0.12 * sev + 0.05); c.sfx('bodyfall', 0.4 + sev * 0.5);
           if (this.hp <= 0 && this.slammed !== false) this.hp = Math.min(this.hp, 0);
           if (this.actName !== 'thugKnockdown' || this.act.time < 0.5) this.play('thugKnockdown', { fade: 0.1, once: true, at: 0.62 });
           this.falling = false; this.landDown();
@@ -316,7 +316,7 @@ export class Enemy {
         if (this.pos.y <= gy && this.vel.y <= 0) {
           this.pos.y = gy;
           const hs = Math.hypot(this.vel.x, this.vel.z);
-          if (hs > 0.6) { this.vel.y = 0; this.vel.x *= Math.exp(-7 * dt); this.vel.z *= Math.exp(-7 * dt); if (!this.dusted) { this.dusted = true; c.fx.dust(this.pos, { amount: 0.8 }); c.sfx('land', 0.6); } }
+          if (hs > 0.6) { this.vel.y = 0; this.vel.x *= Math.exp(-7 * dt); this.vel.z *= Math.exp(-7 * dt); if (!this.dusted) { this.dusted = true; c.fx.dust(this.pos, { amount: 0.8 }); c.sfx('bodyfall', 0.6); } }
           else this.landDown();
         }
         break;

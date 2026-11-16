@@ -179,6 +179,35 @@ function bus({ tour = false } = {}) {
   return b.build({ part: true });
 }
 
+// (user r-vanrear) "the white van's back panel is white at medium distance and has texture when I get near": every
+// LOD's rear doors sampled one flat atlas texel (plain paint; up close only the grime / reflections gave it any detail).
+// Planar-project the rear faces (paint + rear glass, all LODs) onto the imagegen rear-door card (atlas VAN_REAR px rect,
+// packed by tools/imagegen/vehicles/pack_atlas.py) so windows, handles, hinges, tail lights and bumper read at every
+// distance; the plate moves up into the card's plate recess. Rear = faces facing -x (incl. the rounded corners) within 0.6 m of the back.
+const VAN_REAR = { x: 448, y: 1680, w: 320, h: 352, S: 2048, z0: -0.98, z1: 0.98, y0: 0.38, y1: 2.54 };
+function vanRear(g0) {
+  const g = g0.index ? g0.toNonIndexed() : g0;
+  const P = g.attributes.position, U = g.attributes.uv, part = g.attributes.aPart; if (!U || !part) return g0;
+  const R = VAN_REAR, a = new THREE.Vector3(), b = new THREE.Vector3(), c = new THREE.Vector3(), n = new THREE.Vector3();
+  let xmin = Infinity; for (let i = 0; i < P.count; i++) xmin = Math.min(xmin, P.getX(i));
+  for (let t = 0; t < P.count; t += 3) {
+    a.fromBufferAttribute(P, t); b.fromBufferAttribute(P, t + 1); c.fromBufferAttribute(P, t + 2);
+    n.subVectors(b, a).cross(c.clone().sub(a)).normalize();
+    if (n.x > -0.25 || (a.x + b.x + c.x) / 3 > xmin + 0.6) continue; // incl. the rounded rear corners (tail-light strips)
+    const pt = part.getX(t);
+    if (pt === 0) { for (let k = 0; k < 3; k++) P.setY(t + k, P.getY(t + k) + 0.33); continue; } // plate -> recess
+    if (pt !== 1 && pt !== 3 && pt !== 6 && pt !== 8) continue;
+    for (let k = 0; k < 3; k++) {
+      const z = P.getZ(t + k), y = P.getY(t + k);
+      const u = THREE.MathUtils.clamp((z - R.z0) / (R.z1 - R.z0), 0.004, 0.996), v = THREE.MathUtils.clamp((R.y1 - y) / (R.y1 - R.y0), 0.004, 0.996);
+      U.setXY(t + k, (R.x + u * R.w) / R.S, (R.y + v * R.h) / R.S);
+      part.setX(t + k, 1); // painted (instance-tinted off-white, clearcoat, grime band): the card carries the detail
+    }
+  }
+  g.computeBoundingSphere();
+  return g;
+}
+
 // Load the Blender-built models (tools/blender/city_vehicles.py). Returns {geos: {name: BufferGeometry}, atlas} or null.
 // (vehicles r1) 13 models x 3 LODs: <name> (LOD0), <name>_l1, <name>_l2; atlas = vehicles_atlas2.webp (imagegen pack).
 let _vehLoad = null; // one fetch/parse shared by the city traffic and systems/crimes.js (car chase)
@@ -203,7 +232,7 @@ export function loadVehicleModels(renderer) {
         g.setAttribute('aAO', new THREE.BufferAttribute(ao, 1));
         g.applyMatrix4(o.matrixWorld);
         g.computeBoundingSphere();
-        geos[o.name] = g;
+        geos[o.name] = /^van(_l\d)?$/.test(o.name) ? vanRear(g) : g;
       });
       const atlas = await new THREE.TextureLoader().loadAsync('/assets/city/tex/vehicles_atlas2.webp');
       atlas.colorSpace = THREE.SRGBColorSpace; atlas.flipY = false;

@@ -20,6 +20,7 @@ import { ropeGrip } from '../web.js';
 import { ropePoint } from '../traversal/rope.js';
 
 const UP = new THREE.Vector3(0, 1, 0), QI = new THREE.Quaternion();
+const _sl = { a: new THREE.Vector3(), b: new THREE.Vector3(), c: new THREE.Vector3(), d: new THREE.Vector3(), e: new THREE.Vector3() }; // swing life scratch
 const _v = new THREE.Vector3(), _v2 = new THREE.Vector3(), _v3 = new THREE.Vector3(), _v4 = new THREE.Vector3();
 const _q = new THREE.Quaternion(), _q2 = new THREE.Quaternion(), _m = new THREE.Matrix4();
 
@@ -32,9 +33,9 @@ const TRANS = {
   runStart: { ground: 0.26 }, runStop: { ground: 0.34 }, turn180: { ground: 0.22 },
   jumpCharge: { jumpLaunch: 0.14, ground: 0.24 },
   jumpLaunch: { air: 0.38, land: 0.12 },
-  air: { ground: 0.2, land: 0.1, swing: 0.26 },
-  swing: { air: 0.34, trick: 0.18, swing: 0.3 },
-  trick: { air: 0.4 },
+  air: { ground: 0.2, land: 0.1, swing: 0.26, wallRun: 0.34, crawl: 0.32 }, // (anim r2) wall catches mid-air snapped in ~2 frames
+  swing: { air: 0.34, trick: 0.18, swing: 0.3, wallRun: 0.34 },
+  trick: { air: 0.4, wallRun: 0.36, crawl: 0.34, swing: 0.3 },
   land: { ground: 0.38, jumpCharge: 0.18, jumpLaunch: 0.14 },
   zip: { perch: 0.14, air: 0.34 },
   perch: { ground: 0.34, perchToStand: 0.18, rope: 0.12 },
@@ -205,7 +206,7 @@ export class Animator {
     this.layers.push(L);
     if (this.layers.length > 6) { // collapse the two oldest into a frozen snapshot
       const [a, b] = this.layers;
-      blendPoses(a.pose, b.pose, smooth(b.w), a.pose);
+      blendPoses(a.pose, b.pose, smooth(b.w), a.pose, null, this.bm('merge' + b.key));
       this.pool.push(b.pose);
       a.node = this.nodes.frozen; a.key = 'frozen'; a.name = 'frozen'; a.w = 1;
       this.layers.splice(1, 1);
@@ -265,7 +266,7 @@ export class Animator {
     for (const L of this.layers) {
       L.node.eval(L, A, L.pose);
       if (first) { out.copy(L.pose); first = false; }
-      else blendPoses(out, L.pose, smooth(L.w), out);
+      else blendPoses(out, L.pose, smooth(L.w), out, null, this.bm('layer' + L.key));
     }
     // trait weights (blended across layers)
     const tw = { foot: 0, look: 0, web: 0 };
@@ -280,10 +281,12 @@ export class Animator {
     this.postQuickYank(dt, A);
     this.postSecondary(dt, A, top);
     this.postLook(dt, A, tw.look * (1 - 0.8 * this.two.max)); // two-handed grip: torso stays square under the line
+    this.postHeadLevel(dt, A, top);
     this.postBreath(dt, A, top);
     if (A.grounded && (A.mode === 'land' || A.mode === 'ground')) tw.foot = Math.max(tw.foot, 0.95);
     this.postFeet(dt, A, tw.foot);
     this.postAirLife(dt, A, top);
+    this.postLimits(dt, A);
     // half-joint helper bones (deltoid/glute, SPIDERMAN.md v3): 50 % of the base bone's local rotation — clips bake this,
     // procedural IK / blends must keep it or the shoulder/hip skin collapses
     this.helpers(out);
@@ -487,7 +490,7 @@ export class Animator {
       const k = clamp(v / (wm.v * wm.dur * hz), 0.2, 1.6);   // stride: planted foot moves back at exactly v (no slide)
       this.locoPose(this.P.loco, 1.2, { k, rate: hz, fc: hz });
       this.locoPhase = (this.locoPhase + dt * hz) % 1;
-      if (wl < 0.999) blendPoses(this.P.idle, this.P.loco, wl, out); else out.copy(this.P.loco);
+      if (wl < 0.999) blendPoses(this.P.idle, this.P.loco, wl, out, null, this.bm(2)); else out.copy(this.P.loco);
       D.clip = `rope walk r${hz.toFixed(2)} k${k.toFixed(2)}`;
     } else { out.copy(this.P.idle); D.clip = on ? 'rope idle' : 'perchStand'; }
     D.wlPrev = wl;
@@ -637,7 +640,7 @@ export class Animator {
     const upright = (kind === 'upright' || kind === 'air') ? 1 : 0;
     const hs = this.speedH;
     const latA = hs * (this.yawRate || 0); // centripetal
-    this.lean.step(upright * smooth((hs - 2.5) / 3) * clamp(-Math.atan(latA / 9.81) * 0.6, -0.2, 0.2), dt);
+    this.lean.step(upright * smooth((hs - 2.5) / 3) * clamp(-Math.atan(latA / 9.81) * 0.85, -0.3, 0.3), dt); // (anim r2) 0.6 / 0.2: he barely banked into run turns
     const fa = (this.accel.x * Math.sin(this.yaw) + this.accel.z * Math.cos(this.yaw));
     this.pitchLean.step(upright * (kind === 'upright' ? clamp(fa / 9.81 * 0.25, -0.08, 0.12) : 0), dt);
     const R = this.visQ || (this.visQ = new THREE.Quaternion());
@@ -724,6 +727,7 @@ export class Animator {
       const tt = A.mode === 'swing' ? this.two.max * smooth(((this.twoPh ?? 0) + 0.2) / 0.4) : 0;
       this.tuckW = damp(this.tuckW || 0, tt, tt > (this.tuckW || 0) ? 8 : (A.mode === 'swing' && (this.twoPh ?? 0) > 0.2 ? 1.2 : 4), dt);
       this.swingLegs(smooth(this.swLegW) * lerp(0.92, 1, Math.max(this.two.max, this.tuckW)), this.tuckW, hand);
+      this.applySwingLife(smooth(this.swLegW)); // (anim r2) per-web style + leg / torso dynamics on top of the hang
     })();
     if (this.webW < 0.01 || !anc) return;
     const b = this.b, rd = this.rd;
@@ -879,7 +883,10 @@ export class Animator {
     const Sw = T.sw || (T.sw = { L: 0, R: 0 });
     const Sp = T.sp || (T.sp = { L: { x: 0, v: 0 }, R: { x: 0, v: 0 } });
     for (const S of ['L', 'R']) {
-      const joining = S === F && T.on;
+      // (user r-anim7) after a hand switch the old second grip (now the web hand) is still letting go: the new free hand only
+      // starts its reach once that has finished. Both weights up at once made twoHandPlan flip arms mid-blend (it plans for
+      // the larger one): ~61 deg upper-arm pop at the crossover.
+      const joining = S === F && T.on && (T[S === 'L' ? 'R' : 'L'] || 0) < 0.02;
       // organic reach (user r11): a slightly under-damped spring (quick, elastic, small settle past the grip) instead of a
       // linear ramp; the let-go is critically damped. T[S] (0..1) is the clamped weight, T.sp[S].x the raw (overshooting) one.
       // user r14: slower, organic — join ~0.55 s with a ~3 % settle overshoot, let-go ~0.55 s critically damped (interruptible:
@@ -888,7 +895,7 @@ export class Animator {
       // even middle, soft settle) plus a ~3 % arrival overshoot; the output is lightly damped so a reversal mid-way
       // (a turn starting during the reach) turns around smoothly from wherever the hand is. Frame-rate independent.
       const sp = Sp[S];
-      sp.p = clamp((sp.p ?? 0) + (joining ? dt / 0.45 : -dt / 0.5), 0, 1);
+      sp.p = clamp((sp.p ?? 0) + (joining ? dt / 0.45 : -dt / (swinging && S === hand ? 0.15 : 0.5)), 0, 1); // (r-anim7) an ex-second grip that is now the web hand lets go fast
       const e = smoother(sp.p) + (joining ? 0.035 * Math.sin(Math.PI * clamp((sp.p - 0.75) / 0.25, 0, 1)) : 0);
       sp.x = damp(sp.x, e, 22, dt); if (sp.p === 0 && sp.x < 0.002) sp.x = 0;
       T[S] = clamp(sp.x, 0, 1);
@@ -1310,10 +1317,12 @@ export class Animator {
     return true;
   }
   stopOneShot() { if (this.shot) this.shot.stop = true; }
+  // per-blend-site hemisphere memory (skeleton.blendPoses `mem`, user r-anim6: no instant arm / leg flips)
+  bm(id) { const M = this._bm || (this._bm = new Map()); let m = M.get(id); if (!m) M.set(id, m = new Int8Array(this.skel.N)); return m; }
   maskFor(kind) {
     const m = new Float32Array(this.skel.N), S = this.skel;
     const under = (i, root) => { while (i >= 0) { if (i === root) return true; i = S.parent[i]; } return false; };
-    const roots = kind === 'arms' ? ['shoulderL', 'shoulderR', 'upperArmL', 'upperArmR'] : ['spine'];
+    const roots = kind === 'arms' ? ['shoulderL', 'shoulderR', 'upperArmL', 'upperArmR'] : kind === 'legs' ? ['upperLegL', 'upperLegR'] : ['spine'];
     for (let i = 0; i < S.N; i++) for (const r of roots) { const ri = S.idx(r); if (ri >= 0 && under(i, ri)) m[i] = 1; }
     return m;
   }
@@ -1328,7 +1337,7 @@ export class Animator {
     if (sh.stopT != null) w *= 1 - smooth((sh.t - sh.stopT) / Math.max(sh.fadeOut, 1e-3));
     if (sh.t >= end || (sh.stopT != null && sh.t - sh.stopT >= sh.fadeOut)) { this.shot = null; return; }
     this.clips.sample(sh.name, sh.t, this.P.e, { loop: sh.loop });
-    blendPoses(out, this.P.e, w, out, sh.mask);
+    blendPoses(out, this.P.e, w, out, sh.mask, this.bm(3));
     this.debug.shot = sh.name;
   }
   sample(n, t, out, opts) { return this.clips.sample(n, t, out, opts); }
@@ -1348,7 +1357,7 @@ export class Animator {
     const m0 = this.locoMeta(A0[0]), m1 = this.locoMeta(A1[0]);
     const ph = this.locoPhase;
     C.sample(A0[0], ((ph + m0.phase0) % 1) * m0.dur, this.P.a);
-    if (w > 0.001) { C.sample(A1[0], ((ph + m1.phase0) % 1) * m1.dur, this.P.b); blendPoses(this.P.a, this.P.b, w, out); }
+    if (w > 0.001) { C.sample(A1[0], ((ph + m1.phase0) % 1) * m1.dur, this.P.b); blendPoses(this.P.a, this.P.b, w, out, null, this.bm(4)); }
     else out.copy(this.P.a);
     // cadence & stride: natural speed/cadence of the blend, then split the speed ratio between rate and stride
     const vN = lerp(m0.v, m1.v, w), fN = lerp(1 / m0.dur, 1 / m1.dur, w);
@@ -1466,18 +1475,18 @@ export class Animator {
     const P = this.P;
     C.sample('webZipFire', Math.min(L.t + 0.04, C.dur('webZipFire') - 1e-3), out, { loop: false });
     const y = clamp(Z.y, 0, 1);
-    if (y > 1e-3) { C.sample('webZipYank', Math.min(D.yankT0 != null ? L.t - D.yankT0 : 0.06 * y, C.dur('webZipYank') - 1e-3), P.c, { loop: false }); blendPoses(out, P.c, y, out); }
+    if (y > 1e-3) { C.sample('webZipYank', Math.min(D.yankT0 != null ? L.t - D.yankT0 : 0.06 * y, C.dur('webZipYank') - 1e-3), P.c, { loop: false }); blendPoses(out, P.c, y, out, null, this.bm(5)); }
     if (Z.g > 1e-3) {
       C.sample('zipFlight', D.travelT != null ? L.t - D.travelT : 0, P.c);
       // level variant (authored face-down for an upright frame) only matters when the frame is not fully tilted
-      blendPoses(out, P.c, Z.g, out);
+      blendPoses(out, P.c, Z.g, out, null, this.bm(6));
     }
     if (Z.c > 1e-3) {
       const cd = C.dur('zipCatch');
       const u = Math.max(Z.c, A.mode !== 'zip' ? 1 : 0);
       const cn = C.first('zipCatchLevel', 'zipCatch'), cdd = C.dur(cn);
       C.sample(cn, Math.min(u, 1) * (cdd - 1e-3), P.c, { loop: false });
-      blendPoses(out, P.c, Z.c, out);
+      blendPoses(out, P.c, Z.c, out, null, this.bm(7));
     }
     const b = this.b.begin(out), rd = this.rd;
     // fire: both arms thrust at the actual target (clip arms point along +Z)
@@ -1581,7 +1590,9 @@ export class Animator {
     // user r9i: run with the torso pitched forward a little more (from the hips up)
     const lean = k * lerp(0.08, 0.14, smooth((v - 8) / 5));
     b.rot('spine', X, lean * 0.45); b.rot('spine1', X, lean * 0.3); b.rot('chest', X, lean * 0.25);
-    b.rot('head', X, -lean * 0.6);   // keep the gaze level
+    // (anim r2) athletic upper back: the run clip carried him chest-out (arched); round the shoulders a touch forward
+    b.rot('chest', X, 0.07 * k); b.rot('neck', X, -0.03 * k);
+    b.rot('head', X, -lean * 0.6 - 0.05 * k);   // keep the gaze level
     for (const S of ['L', 'R']) {
       const sx = S === 'L' ? 1 : -1;
       const f = b.pos('foot' + S, new THREE.Vector3()), hip = b.pos('upperLeg' + S, new THREE.Vector3());
@@ -1625,7 +1636,9 @@ export class Animator {
     }
     const s = as.x * 0.9, sVel = as.v * 0.9;                  // elastic arm phase (resonant gain ~1.1 compensated) + velocity
     const u = smooth((v - 1.4) / 3.6), sp = smooth((v - 9) / 5); // walk -> run, run -> sprint
-    const gain = lerp(0.8, 1.45, u) * lerp(1, 1.1, sp), bias = lerp(-0.02, 0.1, u), abd = lerp(0.1, 0.36, u); // r12: walk = looser, smaller swing // r9g: forward hand stays in front of its own shoulder (no crossing to the sternum)
+    // (anim r2) never two identical strides: the swing amplitude breathes a little (slow noise), like a real runner
+    const vary = 1 + 0.07 * noise1(this.time * 0.55, 11) * u;
+    const gain = lerp(0.8, 1.45, u) * lerp(1, 1.04, sp) * vary, bias = lerp(-0.02, 0.1, u), abd = lerp(0.1, 0.36, u); // r12: walk = looser, smaller swing // r9g: forward hand stays in front of its own shoulder (no crossing to the sternum) // (anim r2) sprint 1.1 -> 1.04: the back arm flung up behind him
     // user r9f: organic torso counter-rotation — the shoulders turn with the arms (forward arm's shoulder leads), the
     // pelvis turns the other way with the legs, the chest rolls slightly toward the forward-arm side; neck/head
     // counter-rotate so the gaze stays steady. s is continuous (from the thigh angles), so it alternates smoothly.
@@ -1640,7 +1653,7 @@ export class Animator {
     const chestD = b.cq(ci, T.q).multiply(this.skel.bQ(ci, T.q2).invert()); // torso rotation from bind (char space)
     for (const S of ['L', 'R']) {
       const sw = S === 'L' ? -s : s; // arm opposite its leg
-      const flex = clamp(bias + gain * sw, lerp(-0.5, -0.78, u), lerp(0.45, 0.85, u));
+      const flex = clamp(bias + gain * sw, lerp(-0.5, lerp(-0.72, -0.62, sp), u), lerp(0.45, 0.85, u)); // (anim r2) sprint back-swing capped (arm flung high behind)
       const fwdAmt = clamp((flex + 0.95) / 1.8, 0, 1);
       // user r9j: the forward arm stays fairly straight (slight bend, hand out in front — not folded to the chest)
       let elbow = lerp(lerp(0.3, 1.2, u), lerp(0.55, 0.85, u), fwdAmt);
@@ -1654,8 +1667,79 @@ export class Animator {
       // pole just outside/behind the elbow target keeps the hinge plane stable at the extremes
       const sx = S === 'L' ? 1 : -1;
       b.ik('arm', S, hd, el.clone().add(_v4.set(sx * 0.05, 0, -0.08).applyQuaternion(chestD)), w, { absolute: true });
-      this.rd.curl(pose, S, lerp(0.45, 0.7, u), w); b.dirty = true;
+      this.rd.curl(pose, S, lerp(0.5, 0.82, u), w); b.dirty = true; // (anim r2) 0.7: flared open fingers at speed; a loose runner's fist
     }
+  }
+  // (anim r2, user: "swinging ... repetitive, more Spider-Man like motions") SWING LIFE on top of the low / bottom / high
+  // clip blend. Each web picks a body style (never the same twice in a row) and the legs / torso move through the arc
+  // on springs, so they lag, swing through and overshoot instead of hanging off the rope as one rigid shape:
+  //   drop-in (ph < 0): legs trail back, knees soft, a slight crunch   bottom: the legs sweep through, the back arches
+  //   upswing (ph > 0): the legs kick forward and up ahead of the body
+  //   styles: 'split' (lead knee up, trail leg long - the classic silhouette), 'tuck' (both knees drawn up), 'long'
+  //   (legs together, extended, toes pointed), 'stride' (running in the air: slow alternating leg cycle)
+  // The lead leg is the one opposite the web hand. w = layer weight (0 while the web is slack / kicking off a wall).
+  swingLife(L, ph, sw, w) {
+    const D = L.data;
+    if (!D.life) {
+      const order = ['split', 'tuck', 'long', 'stride', 'split'];
+      let st; do { st = order[Math.floor(Math.random() * order.length)]; } while (st === this._swLast && Math.random() < 0.9);
+      if (globalThis.__swStyle) st = globalThis.__swStyle; // lab / review: force one style
+      this._swLast = st;
+      D.life = { style: st, side: Math.random() < 0.5 ? 1 : -1, t0: this.time,
+        th: { L: new Spring(0, 2.1, 0.5), R: new Spring(0, 2.1, 0.5) }, kn: { L: new Spring(0, 2.8, 0.55), R: new Spring(0, 2.8, 0.55) },
+        arch: new Spring(0, 2.0, 0.6), stp: Math.random() * TAU };
+    }
+    const F = D.life, dt = this.dt || 0.016;
+    const bump = (x, c, s) => Math.exp(-(((x - c) / s) ** 2));
+    // (a left grip without baked L clips is built as a right grip and mirrored at the end: its lead leg mirrors with it)
+    const lead = D.hand === 'L' && D.nat ? 'R' : 'L', trail = lead === 'L' ? 'R' : 'L';
+    // base sweep through the arc (thigh pitch: - = knee forward, + = back; knee: + = bend)
+    // (anim r2 critic 1: the drop read as kneeling in the air - shins folded back) drop: legs trail LONG, knees soft
+    const sweep = 0.12 * smooth((-ph - 0.15) / 0.6) - 0.5 * bump(ph, 0.3, 0.5) - 0.2 * smooth((ph - 0.55) / 0.4);
+    const kb = 0.18 + 0.35 * bump(ph, 0.15, 0.42); // absolute knee flexion (rad): soft ~10 deg on the drop
+    const tgt = { th: { L: sweep, R: sweep }, kn: { L: kb, R: kb } };
+    const s = F.style, mid = bump(ph, 0.08, 0.55), drop = smooth((-ph - 0.1) / 0.5); // (critic r5: straight 'standing' legs at the bottom: the sweep starts earlier)
+    if (s === 'split') {
+      tgt.th[lead] += -0.6 * (0.2 + 0.8 * mid); tgt.kn[lead] += 1.1 * (0.12 + 0.88 * mid);
+      tgt.th[trail] += 0.22 * mid; tgt.kn[trail] += -0.04;
+    } else if (s === 'tuck') {
+      for (const k of ['L', 'R']) { tgt.th[k] += -0.5 * mid; tgt.kn[k] += 1.05 * (0.1 + 0.9 * mid); }
+      tgt.th[lead] -= 0.08 * mid;
+    } else if (s === 'long') {
+      for (const k of ['L', 'R']) { tgt.kn[k] = 0.06 + 0.12 * mid; }
+    } else if (s === 'stride') { // a slow run in the air through the bottom; legs long on the drop
+      const p = F.stp + TAU * 0.85 * (this.time - F.t0), c = Math.sin(p), a = 1 - 0.7 * drop;
+      tgt.th.L += (-0.38 * c - 0.1) * a; tgt.th.R += (0.38 * c - 0.1) * a;
+      tgt.kn.L += (0.3 + 0.6 * Math.max(0, -Math.cos(p))) * a; tgt.kn.R += (0.3 + 0.6 * Math.max(0, Math.cos(p))) * a;
+    }
+    for (const k of ['L', 'R']) { F.th[k].step(tgt.th[k], dt); F.kn[k].step(tgt.kn[k], dt); }
+    F.arch.step(-0.2 * bump(ph, 0.05, 0.45) + 0.1 * smooth((-ph - 0.4) / 0.4), dt);
+    F.k = w * smooth((this.time - F.t0) / 0.35); // eases in after the attach (the clip pose carries the first frames)
+    F.mirror = D.hand === 'L' && !D.nat;         // the swing pose is mirrored later for this grip: swap the legs here
+    this.swLife = F; F.tSeen = this.time;
+    D.clip += ' +' + s;
+  }
+  // applied on the final pose after swingLegs (postWeb), so the style layer rides on the ref-matched leg hang / tuck.
+  // fade: swLegW (follows the swing in / out over the release)
+  applySwingLife(fade) {
+    const F = this.swLife; if (!F) return;
+    if (this.time - F.tSeen > 0.05) F.k = damp(F.k, 0, 6, this.dt || 0.016); // off the web: the style fades with the release
+    const k = F.k * fade; if (k < 0.01) return;
+    const b = this.b;
+    for (const S2 of ['L', 'R']) {
+      const src = F.mirror ? (S2 === 'L' ? 'R' : 'L') : S2;
+      const thx = clamp(F.th[src].x, -1.1, 0.7);
+      b.rot('upperLeg' + S2, X, (thx < 0 ? thx * (1 - 0.65 * (this.tuckW || 0)) : thx) * k); // (user r-anim3) no extra fold on top of the two-handed tuck
+      // knee = an ABSOLUTE flexion target (the clip + hang underneath came out ~70-90 deg bent on the drop: kneeling in
+      // the air): measure the current bend and turn the shin to the spring's angle
+      const hp = b.pos('upperLeg' + S2, _sl.a), kp = b.pos('lowerLeg' + S2, _sl.b), ap = b.pos('foot' + S2, _sl.c);
+      const cur = _sl.d.copy(kp).sub(hp).normalize().angleTo(_sl.e.copy(ap).sub(kp).normalize());
+      const want = clamp(F.kn[src].x, 0.05, 2.0);
+      b.rot('lowerLeg' + S2, X, (lerp(want, Math.max(want, cur), this.tuckW || 0) - cur) * k); // the two-handed upswing tuck (refs 05-08) keeps its fold
+      b.rot('foot' + S2, X, (F.style === 'long' ? 0.3 : 0.15) * k); // toes pointed in flight
+    }
+    const a = F.arch.x * k;
+    b.rot('spine', X, a * 0.45); b.rot('spine1', X, a * 0.35); b.rot('chest', X, a * 0.2); b.rot('head', X, -a * 0.5);
   }
   // Knee separation (m) of a clip at t=0.5 s: tells a frog-squat perch clip from the legacy hunched one.
   kneeSpread(name) {
@@ -1917,6 +2001,48 @@ export class Animator {
       }
       rd.curl(pose, S, 0.05, w); b.dirty = true;
     }
+  }
+  // (user r-anim3: "legs bending when swinging extreme, go beyond 180 deg in the front ... the crouch is clipping back
+  // in the body. put a restraint on both the hips and knees") JOINT LIMITS on the final pose while airborne / swinging:
+  // hip flexion (thigh vs the pelvis' down axis, forward of it) <= HIP_MAX, knee flexion <= KNEE_MAX. The thigh / shin
+  // is turned back toward the limit inside its own bending plane, so the limb never folds into the torso. Off on the
+  // ground (perch, crouches and landings keep their deep squats).
+  postLimits(dt, A) {
+    const on = A.mode === 'swing' || A.mode === 'air' || A.mode === 'zip';
+    this.limW = damp(this.limW ?? 0, on ? 1 : 0, 8, dt);
+    const w = this.limW; if (w < 0.01) return;
+    const HIP_MAX = 1.95, KNEE_MAX = 2.35; // ~112 deg, ~135 deg
+    const b = this.b, hi = b.i('hips');
+    const hq = b.cq(hi, _q).multiply(this.skel.bQ(hi, _q2).invert());   // pelvis rotation from bind (char space)
+    const down = _sl.d.set(0, -1, 0).applyQuaternion(hq), fwd = _sl.e.set(0, 0, 1).applyQuaternion(hq);
+    for (const S of ['L', 'R']) {
+      const hp = b.pos('upperLeg' + S, _sl.a), kp = b.pos('lowerLeg' + S, _sl.b);
+      const th = kp.sub(hp).normalize();
+      let flex = Math.atan2(th.dot(fwd), th.dot(down));               // 0 = hanging, + forward, pi = up the chest
+      if (flex < -0.6 * Math.PI) flex += TAU;                         // folded past 180 deg over the front (the reported bug)
+      if (flex > HIP_MAX) b.rot('upperLeg' + S, _v4.crossVectors(down, fwd).normalize(), -(flex - HIP_MAX) * w); // back about the pelvis' side axis
+      const k2 = b.pos('lowerLeg' + S, _sl.a), ap = b.pos('foot' + S, _sl.c);
+      const t2 = new THREE.Vector3().copy(k2).sub(b.pos('upperLeg' + S, _sl.b)).normalize(), sh = ap.sub(k2).normalize();
+      const kf = t2.angleTo(sh);
+      if (kf > KNEE_MAX) {
+        const ax = new THREE.Vector3().crossVectors(sh, t2);
+        if (ax.lengthSq() > 1e-8) b.rot('lowerLeg' + S, ax.normalize(), (kf - KNEE_MAX) * w);
+      }
+    }
+  }
+  // (user r-anim4: "fix the head bending down in jump") the jump take-off / airborne jump keeps the head level: the
+  // clip + look-at pitched the chin down. Pitch (from bind, + = looking down) is capped at HEAD_DOWN, split neck / head.
+  postHeadLevel(dt, A, top) {
+    const jump = top.name === 'jumpLaunch' || top.name === 'jumpCharge' || (top.name === 'air' && (top.data.fromJump || top.data.hop));
+    this.headLvW = damp(this.headLvW ?? 0, jump ? 1 : 0, 8, dt);
+    if (this.headLvW < 0.01) return;
+    const b = this.b, hi = b.i('head'); if (hi < 0) return;
+    const hq = b.cq(hi, _q).multiply(this.skel.bQ(hi, _q2).invert());
+    const f = _v4.set(0, 0, 1).applyQuaternion(hq), pitch = Math.atan2(-f.y, Math.hypot(f.x, f.z)), HEAD_DOWN = 0.08;
+    if (pitch <= HEAD_DOWN) return;
+    const side = _v.set(1, 0, 0).applyQuaternion(hq), ex = (pitch - HEAD_DOWN) * this.headLvW;
+    if (b.i('neck') >= 0) b.rot('neck', side, -ex * 0.4);
+    b.rot('head', side, -ex * (b.i('neck') >= 0 ? 0.6 : 1));
   }
   // springy weight of the wings variant: rises on take-off, holds through the rise and apex, relaxes toward the landing
   jumpWingsW(target) {
@@ -2298,7 +2424,7 @@ function makeNodes(S) {
           if (D.cw < 0.999 && !C.sample(idleName, S.idleT, S.P.idle)) S.fallback('idle', S.idleT, S.P.idle);
           if (D.cw > 0.001) {
             if (D.cw >= 0.999) C.sample('fightIdle', S.idleT, S.P.idle);
-            else { C.sample('fightIdle', S.idleT, S.P.fi); blendPoses(S.P.idle, S.P.fi, smooth(D.cw), S.P.idle); }
+            else { C.sample('fightIdle', S.idleT, S.P.fi); blendPoses(S.P.idle, S.P.fi, smooth(D.cw), S.P.idle, null, S.bm(8 + L.key)); }
           }
         }
         else S.idleT = 0;
@@ -2314,7 +2440,7 @@ function makeNodes(S) {
           if (ovr) { const adv = Math.min(S.dt * ovr.fc, D.stop.rem); D.stop.rem -= adv; S.locoPhase = (S.locoPhase + adv) % 1; if (D.stop.rem <= 1e-3) D.stop.done = true; }
           else if (!(D.stop && D.stop.done)) S.locoPhase = (S.locoPhase + S.dt * S.locoInfo.rate * clamp(vr / Math.max(v, 0.1), 0, 1)) % 1;
           L.data.clip = S.locoInfo.clipA ? `${S.locoInfo.clipA}>${S.locoInfo.clipB}@${S.locoInfo.w.toFixed(2)} r${S.locoInfo.rate.toFixed(2)} k${S.locoInfo.k.toFixed(2)}` : 'gait';
-          if (wl < 0.999) blendPoses(S.P.idle, S.P.loco, wl, out); else out.copy(S.P.loco);
+          if (wl < 0.999) blendPoses(S.P.idle, S.P.loco, wl, out, null, S.bm(9 + L.key)); else out.copy(S.P.loco);
         } else { out.copy(S.P.idle); L.data.clip = idleName; }
         if (wl < 0.999 && D.cw < 0.999) S.widenStance(out, (1 - wl) * (1 - smooth(D.cw)));
         L.data.bal = damp(L.data.bal || 0, A.balance ? 1 : 0, 6, S.dt);
@@ -2332,7 +2458,7 @@ function makeNodes(S) {
       eval(L, A, out) {
         oneShot('runStop', L.t, out);
         // the authored skid throws both arms up high: keep ~half of it (balance, not a flail)
-        const idle = C.first('idle'); if (idle) { C.sample(idle, S.idleT, S.P.c); blendPoses(out, S.P.c, 0.5, out, S.armMask || (S.armMask = S.maskFor('arms'))); }
+        const idle = C.first('idle'); if (idle) { C.sample(idle, S.idleT, S.P.c); blendPoses(out, S.P.c, 0.5, out, S.armMask || (S.armMask = S.maskFor('arms')), S.bm(10 + L.key)); }
         S.groundContact(out, 1);
       },
     },
@@ -2369,7 +2495,7 @@ function makeNodes(S) {
         if (!C.sample('jumpCrouch', 0.1 + L.t * 0.8, S.P.a)) { S.fallback('jump', 0, S.P.a); }
         const moving = smooth((v - 1) / 3);
         const wC = lerp(0.35 + 0.6 * smooth(c), 0.22 + 0.45 * smooth(c), moving) * smooth(L.t / 0.12 + 0.3);
-        blendPoses(S.P.c, S.P.a, wC, out);
+        blendPoses(S.P.c, S.P.a, wC, out, null, S.bm(11 + L.key));
         L.data.clip = 'jumpCrouch+' + (v > 1 ? 'loco' : 'idle');
       },
     },
@@ -2380,6 +2506,8 @@ function makeNodes(S) {
         // user r10: "wings" variant (knees tucked under, arms spread wide) on ~40% of jumps and always on charged/high ones
         S.jumpWingsOn = globalThis.__jumpWings != null ? !!globalThis.__jumpWings : (high || Math.random() < 0.4);
         L.data.clip = high && C.has('jumpLaunchHigh') ? 'jumpLaunchHigh' : C.first('jumpLaunchSmall', 'jump');
+        // (user r-anim3) knee tuck depth per jump: higher launches tuck deeper, plus a little randomness
+        S.jumpTuckK = clamp(lerp(0.75, 1.2, clamp((Math.max(A.velocity?.y ?? 0, high ? 13 : 8) - 6) / 8, 0, 1)) * (0.88 + 0.24 * Math.random()), 0.6, 1.25);
         // anticipation already shown (charge node) or running => start at the extension; standing tap => short dip
         const run = S.speedH > 2.5;
         L.data.t0 = prev && prev.name === 'jumpCharge' ? (L.data.clip === 'jumpLaunchHigh' ? 0.1 : 0.06) : run ? 0.12 : A.grounded ? 0.02 : 0.1;
@@ -2388,10 +2516,10 @@ function makeNodes(S) {
       eval(L, A, out) {
         if (!oneShot(L.data.clip, L.t + L.data.t0, out)) { S.fallback('jump', 0, out); return; }
         // high launch: arms drive up but not locked straight overhead — relax them toward the rise pose
-        if (L.data.clip !== 'jumpLaunchHigh' && C.has('jumpCrouch')) { C.sample('jumpCrouch', 0.3, S.P.c); blendPoses(out, S.P.c, 0.6, out, S.armMask || (S.armMask = S.maskFor('arms'))); }
-        if (L.data.clip === 'jumpLaunchHigh' && C.has('airRise')) { C.sample('airRise', L.t, S.P.c); blendPoses(out, S.P.c, 0.6 * smooth((L.t + L.data.t0 - 0.04) / 0.14), out, S.armMask || (S.armMask = S.maskFor('arms'))); }
+        if (L.data.clip !== 'jumpLaunchHigh' && C.has('jumpCrouch')) { C.sample('jumpCrouch', 0.3, S.P.c); blendPoses(out, S.P.c, 0.6, out, S.armMask || (S.armMask = S.maskFor('arms')), S.bm(12 + L.key)); }
+        if (L.data.clip === 'jumpLaunchHigh' && C.has('airRise')) { C.sample('airRise', L.t, S.P.c); blendPoses(out, S.P.c, 0.6 * smooth((L.t + L.data.t0 - 0.04) / 0.14), out, S.armMask || (S.armMask = S.maskFor('arms')), S.bm(13 + L.key)); }
         S.jumpArms(out, smooth((L.t + L.data.t0 - 0.02) / 0.12) * 0.9, 1, 0);
-        S.jumpTuck(out, smooth((L.t + L.data.t0 - 0.1) / 0.18) * 0.8);
+        S.jumpTuck(out, smooth((L.t + L.data.t0 - 0.1) / 0.18) * 0.8 * (S.jumpTuckK ?? 1));
         S.jumpWings(out, S.jumpWingsW(S.jumpWingsOn && L.t + L.data.t0 > 0.05 ? 1 : 0));
       },
     },
@@ -2401,6 +2529,7 @@ function makeNodes(S) {
         const fromSwing = prev && (prev.name === 'swing' || prev.name === 'zip');
         L.data.hop = !!(prev && prev.name === 'jumpLaunch' && prev.data.clip !== 'jumpLaunchHigh');
         L.data.wings = !!(prev && prev.name === 'jumpLaunch' && S.jumpWingsOn); // the wings jump carries on through the air
+        L.data.fromJump = !!(prev && prev.name === 'jumpLaunch');
         const tr = A.trick;
         if (tr === 'spread' || tr === 'tuck' || fromSwing || A.sub === 'release') {
           // explicit variant from traversal, else alternate (spread is the default "star" release; tuck on big pops)
@@ -2424,26 +2553,40 @@ function makeNodes(S) {
         const ok = rise && apex && fall;
         if (!ok) { S.fallback((A.velocity?.y ?? 0) < -8 ? 'fall' : 'jump', S.airT, out); return; }
         C.sample(apex, t, S.P.a);
-        if (wr > 0.001) { C.sample(rise, t, S.P.b); blendPoses(S.P.a, S.P.b, wr, S.P.a); }
-        if (wf > 0.001) { C.sample(fall, t, S.P.b); blendPoses(S.P.a, S.P.b, wf, S.P.a); }
-        if (L.data.dive > 0.001 && dive) { C.sample(dive, t, S.P.b); blendPoses(S.P.a, S.P.b, smooth(L.data.dive), S.P.a); }
+        if (wr > 0.001) { C.sample(rise, t, S.P.b); blendPoses(S.P.a, S.P.b, wr, S.P.a, null, S.bm(14 + L.key)); }
+        if (wf > 0.001) { C.sample(fall, t, S.P.b); blendPoses(S.P.a, S.P.b, wf, S.P.a, null, S.bm(15 + L.key)); }
+        if (L.data.dive > 0.001 && dive) { C.sample(dive, t, S.P.b); blendPoses(S.P.a, S.P.b, smooth(L.data.dive), S.P.a, null, S.bm(16 + L.key)); }
         L.data.clip = wr > 0.5 ? rise : wf > 0.5 ? (L.data.dive > 0.5 ? dive : fall) : apex;
+        L.data.relW = 0;
         if (L.data.rel) { // release variant one-shot, then melt into the blend space
           const d = C.dur(L.data.rel), wRel = 1 - smooth((L.t - (d - 0.35)) / 0.35);
-          if (wRel > 0.001) { oneShot(L.data.rel, L.t, S.P.b); blendPoses(S.P.a, S.P.b, wRel, S.P.a); L.data.clip = L.data.rel; }
+          L.data.relW = wRel; // (user r-anim6) the knee tuck fades in as the release melts out (was 0 -> 0.8 in one frame)
+          if (wRel > 0.001) { oneShot(L.data.rel, L.t, S.P.b); blendPoses(S.P.a, S.P.b, wRel, S.P.a, null, S.bm(17 + L.key)); L.data.clip = L.data.rel; }
           else L.data.rel = null;
         }
         out.copy(S.P.a);
         // user r10m: a real head-first dive (refs/swing/dive_*) — the whole body tips toward head-down as the fall speeds up
         { const dk = smooth(L.data.dive) * smooth((-vy - 10) / 22) * (A.glide ? 0 : 1);
           if (dk > 0.001) { const bd = S.b.begin(out); bd.rot('hips', X, (window.__divePitch ?? 1.2) * dk); } }
-        if (L.data.hop && C.has('jumpCrouch')) { C.sample('jumpCrouch', 0.3, S.P.c); blendPoses(out, S.P.c, 0.5, out, S.armMask || (S.armMask = S.maskFor('arms'))); }
+        if (L.data.hop && C.has('jumpCrouch')) { C.sample('jumpCrouch', 0.3, S.P.c); blendPoses(out, S.P.c, 0.5, out, S.armMask || (S.armMask = S.maskFor('arms')), S.bm(18 + L.key)); }
         // user r17: free arms are ALWAYS the jump-arm pose in the air — also through the release one-shot (the old
         // 0 -> 0.85 switch when the release clip ended popped the clip's inward-twisted arms to the jump arms)
         { const wa = (1 - smooth(L.data.dive)) * 0.85; S.jumpArms(out, wa, wr, wf); }
-        { const wt = (1 - smooth(L.data.dive)) * (L.data.rel ? 0 : 1) * (1 - smooth((-vy - 3) / 6)) * 0.8; S.jumpTuck(out, wt); }
+        { const wt = (1 - smooth(L.data.dive)) * (1 - L.data.relW) * (1 - smooth((-vy - 3) / 6)) * 0.8 * (L.data.fromJump ? (S.jumpTuckK ?? 1) : 1); S.jumpTuck(out, wt); }
         // wings variant: holds through the rise + apex, relaxes as he falls toward a landing (spring blend, no pop)
         S.jumpWings(out, S.jumpWingsW(L.data.wings && !L.data.rel ? (1 - smooth(L.data.dive)) * (1 - smooth((-vy - 2) / 7)) : 0));
+        // (anim r2 critic: a running landing touched down bolt upright, knees locked, then popped into the run) with real
+        // forward speed the last ~0.3 s of the fall already blends the LEGS into the run stride, so he lands running
+        // (user r-anim5: blending the arms too switched them into the run swing mid-air - they keep the jump arms)
+        { const C0 = S.io?.center, W = S.world, hs = S.speedH;
+          let rw = 0;
+          if (C0 && W?.groundHeight && vy < -1 && hs > 4 && !L.data.rel) {
+            const g = W.groundHeight(C0.x, C0.z, C0.y);
+            if (g != null && isFinite(g)) { const tti = (C0.y - (S.io.H ?? 0.95) - g) / Math.max(2, -vy); rw = smooth((0.32 - tti) / 0.24) * smooth((hs - 4) / 3) * (1 - smooth(L.data.dive)); }
+          }
+          L.data.runIn = damp(L.data.runIn || 0, rw, 14, S.dt);
+          if (L.data.runIn > 0.01) { S.locoPose(S.P.c, hs); S.armPump(S.P.c, hs, 1); S.runTrack(S.P.c, hs); blendPoses(out, S.P.c, smooth(L.data.runIn) * 0.85, out, S.legMask || (S.legMask = S.maskFor('legs')), S.bm(19 + L.key)); }
+        }
         S.groundReach(out, A);
       },
     },
@@ -2521,7 +2664,7 @@ function makeNodes(S) {
         let land = 0;
         if (!L.data.landed && C.has('perchLand')) {
           const d = C.dur('perchLand') - L.data.t0, w = 1 - smooth((L.t - (d - 0.3)) / 0.3);
-          if (w > 0.001) { oneShot('perchLand', L.data.t0 + L.t, S.P.b); blendPoses(S.P.a, S.P.b, w, S.P.a); L.data.clip = 'perchLand'; }
+          if (w > 0.001) { oneShot('perchLand', L.data.t0 + L.t, S.P.b); blendPoses(S.P.a, S.P.b, w, S.P.a, null, S.bm(20 + L.key)); L.data.clip = 'perchLand'; }
           land = 1;
         }
         out.copy(S.P.a);
@@ -2560,7 +2703,7 @@ function makeNodes(S) {
         if (ws < 0.999) {
           const PL = L.data.perch; PL.t += S.dt;
           nodes.perch.eval(PL, A, S.P.d);
-          blendPoses(S.P.d, S.P.c, ws, out);
+          blendPoses(S.P.d, S.P.c, ws, out, null, S.bm(21 + L.key));
           L.data.clip = (sub === 'ropeShoot' ? 'rope shoot' : 'rope stand') + ' +perch';
         } else out.copy(S.P.c);
         if (onRope && R.t < R.pinT + 0.25) S.ropeShootArm(out, A);
@@ -2711,8 +2854,8 @@ function makeNodes(S) {
         if (lo && bo && hi) {
           const wl = smooth(-ph), wh = smooth(ph);
           C.sample(bo, t, S.P.a);
-          if (wl > 0.001) { C.sample(lo, t, S.P.b); blendPoses(S.P.a, S.P.b, wl, S.P.a); }
-          if (wh > 0.001) { C.sample(hi, t, S.P.b); blendPoses(S.P.a, S.P.b, wh, S.P.a); }
+          if (wl > 0.001) { C.sample(lo, t, S.P.b); blendPoses(S.P.a, S.P.b, wl, S.P.a, null, S.bm(22 + L.key)); }
+          if (wh > 0.001) { C.sample(hi, t, S.P.b); blendPoses(S.P.a, S.P.b, wh, S.P.a, null, S.bm(23 + L.key)); }
           L.data.clip = ph < -0.35 ? lo : ph > 0.35 ? hi : bo;
         } else if (C.has('swing')) { // single arc clip: 0 back, 18 bottom, 32 front (of 56 @30fps)
           const f = ph < 0 ? 18 * (ph + 1) : 18 + 14 * ph; C.sample('swing', f / 30, S.P.a, { loop: false }); L.data.clip = 'swing'; L.data.nat = false;
@@ -2720,26 +2863,27 @@ function makeNodes(S) {
         // long swings: the free hand joins the line (postWeb twoHand, ramps in over ~0.3 s once the swing carries on past
         // ~0.45 s towards the bottom). Body follows the two-handed clip: legs together + tucked, torso hanging under the grip.
         const two = C.has('swingTwoHanded') ? smooth(S.two[L.data.hand === 'L' ? 'R' : 'L']) * 0.5 : 0;
-        if (two > 0.01) { C.sample('swingTwoHanded', t, S.P.b); if (L.data.nat) S.mirror(S.P.b); blendPoses(S.P.a, S.P.b, two, S.P.a); } // L parity
+        if (two > 0.01) { C.sample('swingTwoHanded', t, S.P.b); if (L.data.nat) S.mirror(S.P.b); blendPoses(S.P.a, S.P.b, two, S.P.a, null, S.bm(24 + L.key)); } // L parity
         // corner bank (clip banks toward the character's left; mirror for right banks)
         if (L.data.nat && C.has('swingCornerBankL') && Math.abs(bank) > 0.02) {
           // swingCornerBankL grips left and rolls to his left (= turning left, bank > 0); turning right: mirrored
           C.sample('swingCornerBankL', t, S.P.b);
           if (bank < 0) S.mirror(S.P.b);
-          blendPoses(S.P.a, S.P.b, smooth(Math.abs(bank)) * 0.85, S.P.a);
+          blendPoses(S.P.a, S.P.b, smooth(Math.abs(bank)) * 0.85, S.P.a, null, S.bm(25 + L.key));
         } else if (C.has('swingCornerBank') && Math.abs(bank) > 0.02) {
           C.sample('swingCornerBank', t, S.P.b);
           // the whole pose is mirrored afterwards for a left-hand grip, so pre-flip the bank side for it
           const bk = L.data.hand === 'L' ? -bank : bank;
           if (bk * S.mirrorBank < 0) S.mirror(S.P.b);
-          blendPoses(S.P.a, S.P.b, smooth(Math.abs(bank)) * 0.85, S.P.a);
+          blendPoses(S.P.a, S.P.b, smooth(Math.abs(bank)) * 0.85, S.P.a, null, S.bm(26 + L.key));
         }
         // slack web (over the top of a held swing): he is free-falling inside the circle, not hanging -> apex/fall pose
         // (the web hand keeps its grip via the arm aim). Wall-skip: brief tucked kick-off pose off the facade.
         const slack = smooth(sw.slack ?? 0), kick = smooth(sw.kick ?? 0);
         // slack: controlled tuck (knees up, core engaged) rather than a limp apex pose
-        if (slack > 0.01) { const f = C.first('releaseTuck', 'airApex'); if (f) { C.sample(f, f === 'releaseTuck' ? 0.3 : L.t, S.P.b, { loop: false }); blendPoses(S.P.a, S.P.b, slack * 0.6, S.P.a); } }
-        if (kick > 0.01) { const k = C.first('wallJump'); if (k) { C.sample(k, 0.14 + 0.1 * (1 - (sw.kick ?? 0)), S.P.b); blendPoses(S.P.a, S.P.b, kick * 0.7, S.P.a); } }
+        if (slack > 0.01) { const f = C.first('releaseTuck', 'airApex'); if (f) { C.sample(f, f === 'releaseTuck' ? 0.3 : L.t, S.P.b, { loop: false }); blendPoses(S.P.a, S.P.b, slack * 0.6, S.P.a, null, S.bm(27 + L.key)); } }
+        if (kick > 0.01) { const k = C.first('wallJump'); if (k) { C.sample(k, 0.14 + 0.1 * (1 - (sw.kick ?? 0)), S.P.b); blendPoses(S.P.a, S.P.b, kick * 0.7, S.P.a, null, S.bm(28 + L.key)); } }
+        if (L.w > 0.5 || !S.swLife) S.swingLife(L, ph, sw, (1 - slack) * (1 - kick)); // the dominant grip layer drives it (applied after swingLegs, postWeb)
         out.copy(S.P.a);
         if (L.data.hand === 'L' && !L.data.nat) S.mirror(out);
       },
@@ -2773,9 +2917,9 @@ function makeNodes(S) {
         L.data.k = moving ? k : 1;
         if (moving) S.wallPhase = (S.wallPhase + S.dt * fN * rate) % 1;
         C.sample(slow, ((S.wallPhase + ms.phase0) % 1) * ms.dur, S.P.a);
-        if (wFast > 0.001) { C.sample(quick, ((S.wallPhase + mf.phase0) % 1) * mf.dur, S.P.b); blendPoses(S.P.a, S.P.b, wFast, S.P.a); }
+        if (wFast > 0.001) { C.sample(quick, ((S.wallPhase + mf.phase0) % 1) * mf.dur, S.P.b); blendPoses(S.P.a, S.P.b, wFast, S.P.a, null, S.bm(29 + L.key)); }
         const wIdle = 1 - smooth(m);
-        if (wIdle > 0.001) { C.sample(idle, L.t, S.P.b); blendPoses(S.P.a, S.P.b, wIdle, S.P.a); }
+        if (wIdle > 0.001) { C.sample(idle, L.t, S.P.b); blendPoses(S.P.a, S.P.b, wIdle, S.P.a, null, S.bm(30 + L.key)); }
         L.data.clip = wIdle > 0.5 ? idle : wFast > 0.5 ? quick : slow;
         out.copy(S.P.a);
         S.climbPose(out, S.dt, sp, moving);
@@ -2897,7 +3041,7 @@ function makeNodes(S) {
         else {
           oneShot(L.data.climb, t - L.data.grab, out, { lock: null }); L.data.clip = L.data.climb;
           const bw = 1 - smooth((t - L.data.grab) / 0.06);
-          if (bw > 0.001) { oneShot('ledgeGrab', L.data.grab, S.P.c, { lock: null }); blendPoses(out, S.P.c, bw, out); }
+          if (bw > 0.001) { oneShot('ledgeGrab', L.data.grab, S.P.c, { lock: null }); blendPoses(out, S.P.c, bw, out, null, S.bm(31 + L.key)); }
         }
       },
       frame(L) { return { kind: 'ledge', O: L.data.O, fwd: L.data.f, w: smooth(L.t / 0.1) }; },

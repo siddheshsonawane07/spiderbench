@@ -21,15 +21,22 @@ export class Pose {
 
 // out = a*(1-t) + b*t (nlerp with hemisphere fix; accurate enough for t-blends of nearby poses, and
 // cheap). `mask` (Float32Array per bone, optional) scales t per bone.
-export function blendPoses(a, b, t, out, mask = null) {
+// `mem` (Int8Array per bone, optional, one per blend site): hemisphere continuity. When a bone's two rotations are
+// ~180 deg apart (dot ~ 0) the shortest way round flips sides as soon as the dot crosses zero, and the blended
+// result jumps (user r-anim6: jump arms twisting in an instant = 134 deg in one frame). With `mem` the side chosen
+// last frame is kept while the blend is partial; it is only re-chosen where that cannot pop: weight 0 / 1, or the
+// two rotations close together (|dot| > 0.85).
+export function blendPoses(a, b, t, out, mask = null, mem = null) {
   const n = a.n, qa = a.q, qb = b.q, qo = out.q, pa = a.p, pb = b.p, po = out.p;
   for (let i = 0; i < n; i++) {
     const w = mask ? t * mask[i] : t;
     const k = i * 4, j = i * 3;
-    if (w <= 0) { if (out !== a) { qo[k] = qa[k]; qo[k + 1] = qa[k + 1]; qo[k + 2] = qa[k + 2]; qo[k + 3] = qa[k + 3]; po[j] = pa[j]; po[j + 1] = pa[j + 1]; po[j + 2] = pa[j + 2]; } continue; }
-    if (w >= 1) { qo[k] = qb[k]; qo[k + 1] = qb[k + 1]; qo[k + 2] = qb[k + 2]; qo[k + 3] = qb[k + 3]; po[j] = pb[j]; po[j + 1] = pb[j + 1]; po[j + 2] = pb[j + 2]; continue; }
+    if (w <= 0) { if (mem) mem[i] = 0; if (out !== a) { qo[k] = qa[k]; qo[k + 1] = qa[k + 1]; qo[k + 2] = qa[k + 2]; qo[k + 3] = qa[k + 3]; po[j] = pa[j]; po[j + 1] = pa[j + 1]; po[j + 2] = pa[j + 2]; } continue; }
+    if (w >= 1) { if (mem) mem[i] = 0; qo[k] = qb[k]; qo[k + 1] = qb[k + 1]; qo[k + 2] = qb[k + 2]; qo[k + 3] = qb[k + 3]; po[j] = pb[j]; po[j + 1] = pb[j + 1]; po[j + 2] = pb[j + 2]; continue; }
     const dot = qa[k] * qb[k] + qa[k + 1] * qb[k + 1] + qa[k + 2] * qb[k + 2] + qa[k + 3] * qb[k + 3];
-    const s = dot < 0 ? -w : w, r = 1 - w;
+    let sg = dot < 0 ? -1 : 1;
+    if (mem) { if (mem[i] && Math.abs(dot) < 0.85) sg = mem[i]; mem[i] = sg; }
+    const s = sg * w, r = 1 - w;
     let x = qa[k] * r + qb[k] * s, y = qa[k + 1] * r + qb[k + 1] * s, z = qa[k + 2] * r + qb[k + 2] * s, ww = qa[k + 3] * r + qb[k + 3] * s;
     const l = 1 / Math.hypot(x, y, z, ww);
     qo[k] = x * l; qo[k + 1] = y * l; qo[k + 2] = z * l; qo[k + 3] = ww * l;

@@ -50,10 +50,25 @@ export function createChaseCamera(camera, world) {
   c.getLookDir = (out = new THREE.Vector3()) => camera.getWorldDirection(out);
 
   // Mouse / stick orbit — applied before traversal so movement is relative to this frame's camera.
-  c.applyLook = I => {
+  // c.lookSmooth (s, 0 = off; dev menu "Smooth mouse camera"): the mouse delta is banked and fed in exponentially with this
+  // time constant, so the view glides after the hand instead of following every jitter of the mouse (the total turn is
+  // the same, only spread over time)
+  c.lookSmooth = 0; c.pendX = 0; c.pendY = 0;
+  c.applyLook = (I, dt = 1 / 60) => {
     const l = I.look;
-    if (Math.abs(l.dx) + Math.abs(l.dy) > 0.5) c.lastLook = 0;
-    c.yaw -= l.dx * c.sens; c.pitch = clamp(c.pitch + l.dy * c.sens, -0.9, 1.25);
+    let dx = l.dx, dy = l.dy;
+    if (c.lookSmooth > 0) {
+      c.pendX += dx; c.pendY += dy;
+      const k = 1 - Math.exp(-Math.min(dt, 0.1) / c.lookSmooth);
+      dx = c.pendX * k; dy = c.pendY * k; c.pendX -= dx; c.pendY -= dy;
+      if (Math.abs(c.pendX) < 0.01) c.pendX = 0;
+      if (Math.abs(c.pendY) < 0.01) c.pendY = 0;
+    } else c.pendX = c.pendY = 0;
+    if (Math.abs(l.dx) + Math.abs(l.dy) > 0.5 || Math.abs(c.pendX) + Math.abs(c.pendY) > 0.5) c.lastLook = 0; // still gliding = still looking (no auto-recenter)
+    c.yaw -= dx * c.sens;
+    const p = c.pitch + dy * c.sens, pc = clamp(p, -0.9, 1.25);
+    if (pc !== p) c.pendY = 0; // at the pitch stop: drop the banked vertical turn (no delayed push against the limit)
+    c.pitch = pc;
   };
 
   // p: {pos (body centre), vel, mode, sub, anchor, wallNormal, perchNormal, facing, dive, tension, bank}
@@ -160,6 +175,7 @@ export function createChaseCamera(camera, world) {
     wantFov = 58 + 13 * smooth(speed, 12, 44) + (dive ? 5 : 0);
     // web slingshot: the camera draws back, lifts and widens as the webs stretch (p.sling 0..1, 0 = off)
     if (p.sling > 0) { wantDist += 1.6 * p.sling; wantH += 0.3 * p.sling; wantFov += 8 * p.sling * p.sling; }
+    wantDist += c.extraDist || 0; wantH += 0.18 * (c.extraDist || 0); // (reel) scripted pull-back to show more of the city (0 in play)
     // all critically damped (release/attach/landing change every one of these targets in a single frame)
     sd(c, 'dist', wantDist, 0.55, dt);
     sd(c, 'heightOff', wantH, 0.5, dt);

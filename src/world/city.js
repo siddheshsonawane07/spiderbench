@@ -29,6 +29,7 @@ import { buildPeds } from './peds.js';
 import { buildFlags } from './flags.js';
 import { buildRooftops } from './rooftops.js';
 import { buildSignage } from './signage.js'; // billboards: city-wide signage
+import { buildNeon } from './neon.js'; // (night) exterior neon + LED strips on shops, awnings, canopies
 import { attachLife } from './npc/life.js';
 import { applyDistanceFade } from './pool.js';
 import { batchTiles } from './tilebatch.js'; // (perf)
@@ -158,6 +159,7 @@ export async function buildCity({ scene, renderer }) {
     });
   }
   if (gen.variety) console.log('[city] (layout2 r3) block variety', JSON.stringify(gen.variety));
+  buildNeon({ scene: root, solids: gen.solids }); // (night) after signage + props: awning / canopy solids exist
   const trees = buildTrees({ scene: root, T, spots: props.treeSpots, parkPaths: ground.parkPaths });
   const traffic = buildTraffic({ scene: root, phase: props.phase, models: vehModels });
   const peds = await buildPeds({ scene: root, blocks, parkPaths: ground.parkPaths, props, traffic }); // citylife

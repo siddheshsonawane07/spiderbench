@@ -43,6 +43,13 @@ const REL_UP = 9;           // every swing release: upward pop (m/s; vy = max(vy
 const REL_UP_VY = 16;       // user r10f: chained swings must climb ("give more height after each swing"); Space-release pops higher
 const SWING_DIP = 24;   // sid r2: deeper plunge (was 6)
 const SWING_GAIN = 5;       // climb assist target: exit this far above the attach height (m) — user r10f        // max arc dip below the attach height (m) — user r10f
+// (user r-anim7) "give a visible boost to height and speed when i do a 50%+ swing": swing completion = how far the rope
+// got (furthest angle reached) from its attach angle toward the mirrored angle on the far side (0.5 = released at the bottom, 1 = a full
+// symmetric arc). From 50 % it adds forward speed and an extra upward pop, ramping to full at FULL_SWING_K; the speed cap
+// is raised by the same amount so it is not clamped away. The camera gets a FOV kick (event 'swingBoost').
+const FULL_SWING_FWD = 7;   // m/s forward at full completion
+const FULL_SWING_UP = 7;    // m/s extra upward pop (and cap) at full completion
+const FULL_SWING_K = 0.85;  // completion at which the boost is full
 const RELEASE_BOOST = 1.5; // m/s added along the release velocity when the web is let go (x skill 'swingReleaseBoost')
 const SWING_DRAG = 0.0022;  // aerodynamic drag while swinging (1/m): a held swing with no input decays like a real pendulum
 const PUMP_MAX_ANG = 1.15;  // pumping (W along the swing) never adds energy beyond what reaches ~75 deg of arc (chains stay in the canyon)
@@ -239,8 +246,15 @@ export function createTraversal({ world, cam, web, rig, camera }) {
     // riding a car roof
     if (s.dyn.t < 0.12 && s.dyn.onTop) { s.pos.x += s.dyn.vel.x * h; s.pos.z += s.dyn.vel.z * h; }
     s.pos.x += s.vel.x * h; s.pos.z += s.vel.z * h;
-    const c = collide();
-    const wide = c ? wideWall(c.normal, c.point) : false;
+    let c = collide();
+    let wide = c ? wideWall(c.normal, c.point) : false;
+    // (user r-wallrun) storefront mullions, window bars, door jambs: the capsule pushes out of a thin box's corner with a
+    // diagonal normal, so the contact read as a pole ("steer around it") and he ran in place against the shop window.
+    // When the running direction faces a broad facade (most of a 3x3 ray fan sees surfaces facing him), use that facade.
+    if (c && mag > 0.3) {
+      const F = facadeAhead(fx, fz);
+      if (F && F.into > 0.55) { c = { ...c, normal: F.normal, point: F.point, top: Math.max(c.top, F.top) }; wide = true; }
+    }
     if (c && !wide) {
       // narrow obstacle (lamp post, signal pole, hydrant, tree trunk): parkour AROUND it — keep speed, steer the heading
       // onto the tangent on the side we are already passing; never wall-run up a pole
@@ -485,10 +499,15 @@ export function createTraversal({ world, cam, web, rig, camera }) {
       const pushIn = inD.dot(c.normal) < -0.4;
       // chaining (RMB held, or just released a swing) and not deliberately steering into the wall: skip off it
       const chaining = (I.swing || s.relT < 0.7) && !pushIn && Math.hypot(s.vel.x, s.vel.z) > 9;
-      if ((into > 0.3 || pushIn) && s.wallCooldown <= 0 && c.top - feetY() > 1.2 && wideWall(c.normal, c.point) && !chaining && !(s.clock < (s.bridgeRetUntil ?? -1))) { // (bridges r2) never cling during a bridge push-back arc
+      let wideC = wideWall(c.normal, c.point);
+      if (!wideC && hv && (into > 0.15 || pushIn)) { // (user r-wallrun) bars / mullions: judge the facade, not the bar corner
+        const F = facadeAhead(hv.x, hv.z);
+        if (F && (F.into > 0.4 || pushIn)) { c.normal.copy(F.normal); c.point.copy(F.point); c.top = Math.max(c.top, F.top); wideC = true; }
+      }
+      if ((into > 0.3 || pushIn) && s.wallCooldown <= 0 && c.top - feetY() > 1.2 && wideC && !chaining && !(s.clock < (s.bridgeRetUntil ?? -1))) { // (bridges r2) never cling during a bridge push-back arc
         // low ledge in front at chest height: mantle instead of sticking to it
         if (c.top - feetY() < 1.9 && s.vel.y > -6) { startVault(c, true); return; }
-        const sp = s.vel.length(); enterWall(c.normal, c.point, (I.swing || I.sprint) && sp > 7 || sp > 18, sp); return;
+        const sp = s.vel.length(); enterWall(c.normal, c.point, (I.swing || I.sprint) && sp > 7 || sp > 18, sp, rawMag > 0.2); return;
       }
       const vn = s.vel.dot(c.normal);
       if (vn < 0) {
@@ -732,7 +751,7 @@ export function createTraversal({ world, cam, web, rig, camera }) {
         S.ropeTarget = Math.max(S.ropeTarget, Math.min(s.pos.distanceTo(S.pivot) - 1, S.pivot.y - fmax - H - bottomFeet));
       } }
     S.rope = s.pos.distanceTo(S.pivot); S.t = 0; S.tension = 0; S.tautT = 0; S.cornered = false; S.y0 = s.pos.y;
-    S.slack = 0; S.slackT = 0; S.kick = 0; S.kickCd = 0; S.apexed = false; S.angMax = -9;
+    S.slack = 0; S.slackT = 0; S.kick = 0; S.kickCd = 0; S.apexed = false; S.angMax = -9; S.ang0 = null; // ang0: attach angle (swing completion)
     // momentum conservation: redirect velocity along the swing tangent keeping speed (dive speed becomes swing speed)
     const rd = _v.copy(S.pivot).sub(s.pos).normalize();
     const sp = s.vel.length(), vr = s.vel.dot(rd);
@@ -932,7 +951,7 @@ export function createTraversal({ world, cam, web, rig, camera }) {
     const f2 = floorAt(s.pos.x, s.pos.z, feetY() + 0.4);
     if (feetY() < f2 + 0.3) { s.pos.y = f2 + 0.3 + H; if (s.vel.y < 0) s.vel.y = 0; }
     // phase / sub-state
-    S.phase = swingPhase(); S.angle = swingAngle();
+    S.phase = swingPhase(); S.angle = swingAngle(); if (S.ang0 == null) S.ang0 = S.angle;
     S.angMax = Math.max(S.angMax ?? -9, S.angle);
     if (!S.apexed && (S.angle < S.angMax - 0.06 && S.angMax > 0.2 || S.t > 4)) S.apexed = true;
     if (S.kick > 0.3) setSub('wallKick');
@@ -1039,10 +1058,16 @@ export function createTraversal({ world, cam, web, rig, camera }) {
     const timing = clamp(SW2.relLo + 1.2 * s.vel.y / Math.max(sp, 1), SW2.relLo, SW2.relHi);
     if (sp > 0.5) s.vel.multiplyScalar((sp + releaseBoost() + CHAIN_REL * (s.chain || 0)) / sp); // + momentum chain (r10g)
     const k = releaseBoost() / RELEASE_BOOST, hv = hdir(s.vel, new THREE.Vector3()) || new THREE.Vector3(Math.sin(s.facing), 0, Math.cos(s.facing));
-    if (kind !== 'jump') { const ku = k * timing; s.vel.y = Math.min(Math.max(s.vel.y, REL_UP_VY), Math.max(s.vel.y + REL_UP * ku, REL_UP * 0.75 * ku)); }
+    // full-swing boost (user r-anim7): completion of the arc since the attach angle
+    const Sw = s.swing, a0 = Sw.ang0 ?? swingAngle(), comp = clamp((Math.max(swingAngle(), Sw.angMax ?? -9) - a0) / Math.max(2 * Math.abs(a0), 0.5), 0, 1.5); // furthest point the arc reached
+    const fb = THREE.MathUtils.smoothstep(comp, 0.5, FULL_SWING_K) * (Sw.t > 0.35 ? 1 : 0), upB = FULL_SWING_UP * fb;
+    s.lastSwingComp = +comp.toFixed(2); s.lastBoost = +fb.toFixed(2);
+    if (fb > 0) { s.vel.x += hv.x * FULL_SWING_FWD * fb; s.vel.z += hv.z * FULL_SWING_FWD * fb; events.push({ type: 'swingBoost', k: fb, comp }); }
+    // sid r2 timing on the release pop (ku) + upstream's full-swing boost (upB): both apply
+    if (kind !== 'jump') { const ku = k * timing; s.vel.y = Math.min(Math.max(s.vel.y, REL_UP_VY + upB), Math.max(s.vel.y + REL_UP * ku + upB, (REL_UP * 0.75 * ku) + upB)); }
     if (kind === 'jump') { // user r11: Space-release = stronger forward push + a jump-off-the-web pop up
       s.vel.x += hv.x * SWING_JUMP * k; s.vel.z += hv.z * SWING_JUMP * k;
-      s.vel.y = Math.min(SWING_JUMP_VY, Math.max(s.vel.y + SWING_JUMP_UP, SWING_JUMP_UP * 0.85));
+      s.vel.y = Math.min(SWING_JUMP_VY + upB, Math.max(s.vel.y + SWING_JUMP_UP + upB, SWING_JUMP_UP * 0.85 + upB));
       s.jumpRelHold = true; // user r10c: with RMB still held the next web re-attached ~0.35 s later and ate the pop — no new web until the apex
     }
     setMode('air', 'release'); s.airT = 0; s.apexY = feetY();
@@ -1054,8 +1079,8 @@ export function createTraversal({ world, cam, web, rig, camera }) {
     if (force ? force !== 'none' && room : room && (!s.lastTrick || rnd() < 0.8)) { startTrick(TRICK_DEF[force] ? force : chooseTrick(I)); s.lastTrick = true; }
     else { s.trick = null; s.lastTrick = false; s.vel.x += hv.x * REL_NOTRICK * k; s.vel.z += hv.z * REL_NOTRICK * k; }
     s.trickNoUp = false; // user r10f: every release gains height again (the trick's small `up` lands at its snap too)
-    const hs = Math.hypot(s.vel.x, s.vel.z), hl = Math.max(vmaxC(), sp); if (hs > hl) { s.vel.x *= hl / hs; s.vel.z *= hl / hs; }
-    events.push({ type: 'release', kind, trick: s.trick });
+    const hs = Math.hypot(s.vel.x, s.vel.z), hl = Math.max(vmaxC(), sp) + FULL_SWING_FWD * fb; if (hs > hl) { s.vel.x *= hl / hs; s.vel.z *= hl / hs; }
+    events.push({ type: 'release', kind, trick: s.trick, comp: +comp.toFixed(2), boost: +fb.toFixed(2) });
   }
 
   // ------------------------------------------------------------------ wall
@@ -1071,15 +1096,70 @@ export function createTraversal({ world, cam, web, rig, camera }) {
     }
     return ok === 2;
   }
-  function enterWall(n, point, run, speed = 0) {
+  // (user r-wallrun) broad facade in the horizontal direction (dx, dz): a 3x3 ray fan (knee / chest / head x left / mid /
+  // right) out to 1.3 m; faces turned toward us (bar fronts, glass, piers, masonry) vote, bar sides and poles don't. A
+  // facade = >= 5 of 9 rays agree. Returns the mean normal, the nearest point and the tallest surface seen (for `top`).
+  const _fo = new THREE.Vector3(), _fd = new THREE.Vector3(), _fp = new THREE.Vector3();
+  function facadeAhead(dx, dz) {
+    const tx = -dz, tz = dx; let nx = 0, nz = 0, k = 0, bd = Infinity; _fd.set(dx, 0, dz);
+    for (const oy of [-0.45, 0.3, 0.95]) for (const ol of [-0.38, 0, 0.38]) {
+      const hit = world.raycast(_fo.set(s.pos.x + tx * ol, s.pos.y + oy, s.pos.z + tz * ol), _fd, R + 0.95);
+      if (!hit || Math.abs(hit.normal.y) > 0.5 || hit.normal.x * dx + hit.normal.z * dz > -0.5) continue;
+      nx += hit.normal.x; nz += hit.normal.z; k++;
+      if (hit.distance < bd) { bd = hit.distance; _fp.copy(hit.point); }
+    }
+    if (k < 5) return null;
+    const l = Math.hypot(nx, nz) || 1; nx /= l; nz /= l;
+    const up = world.raycast(_fo.set(s.pos.x, feetY() + 2.6, s.pos.z), _fd, R + 1.4); // still a wall above head height?
+    return { normal: new THREE.Vector3(nx, 0, nz), point: _fp.clone(), into: -(dx * nx + dz * nz), top: up && Math.abs(up.normal.y) < 0.5 ? feetY() + 3 : feetY() + 1.9 };
+  }
+  // (user r-wallrun) a surface top found in the climb path is the real wall top only if the facade does not carry on
+  // above it (a window sill / recess floor / cornice / sign top has more wall right behind and above it)
+  function realTop(n, topY) {
+    const reach = R + 0.02 + (s.wall.off || 0) + 2.1; // setbacks up to ~2 m are stepped over (see the setback step in stepWall)
+    for (const dy of [1.1, 2.1]) {
+      const hit = world.raycast(_fo.set(s.pos.x, topY + dy, s.pos.z), _fd.set(-n.x, 0, -n.z), reach);
+      if (hit && Math.abs(hit.normal.y) < 0.5 && hit.normal.dot(n) > 0.5) return false;
+    }
+    return true;
+  }
+  function enterWall(n, point, run, speed = 0, moving = false) {
     const W = s.wall;
     W.normal.copy(n).setY(0).normalize();
     s.pos.x = point.x + W.normal.x * (R + 0.02); s.pos.z = point.z + W.normal.z * (R + 0.02);
     W.runV = run ? clamp(Math.max(speed * 0.8, s.vel.y), WALLRUN * 0.9, WALLRUN * 1.15) : Math.max(0, Math.min(8, s.vel.y));   // r9q: carry ~run speed onto the wall
     W.fast = run; s.vel.set(0, 0, 0); s.dive = false; s.trick = null;
     W.up.set(0, 1, 0); W.off = 0; W.runK = 0; W.dist = R + 0.02; W.point.set(point.x, s.pos.y, point.z);
-    setMode('wall', run ? 'wallRun' : 'crawl'); s.grounded = false; s.dashCount = 0;
+    setMode('wall', run || moving ? 'wallRun' : 'crawl'); s.grounded = false; s.dashCount = 0; // (user r-wallrun) a held direction never flashes the cling pose on arrival
     events.push({ type: 'wall', run });
+  }
+  // (user r-wallrun) is the obstacle beside us a real inner corner (a wall sticking out > ~1 m) or a shallow fin / pier /
+  // bar / pipe (the running surface lifts over it: see the look-ahead relief in stepWall)?
+  function deepSide(n, side) {
+    for (const k of [0.75, 1.1]) {
+      const hit = world.raycast(_fo.copy(s.pos).addScaledVector(n, k), side, R + 0.45);
+      if (!hit || Math.abs(hit.normal.y) > 0.5 || hit.normal.dot(side) > -0.7) return false;
+    }
+    return true;
+  }
+  // (user r-wallrun) the wall probe lost the facade, but it steps back <= 2.2 m (terrace ledge, setback, deep recess) and
+  // the new face carries on above: re-base on it keeping the body where it is (W.off = the step depth, then the relief
+  // envelope lets him in over the ledge smoothly) instead of dropping off or hopping onto a ledge with no room.
+  function setbackStep(n, vy) {
+    if (vy < -0.5 && Math.abs(vy) > 1) return false;
+    const W = s.wall;
+    for (const oy of [0.35, 0.9, -0.2]) {
+      const far = world.raycast(_fo.copy(s.pos).setY(s.pos.y + oy), _fd.set(-n.x, 0, -n.z), R + 2.5 + W.off);
+      if (!far || Math.abs(far.normal.y) > 0.5 || far.normal.dot(n) < 0.9) continue;
+      const above = world.raycast(_fo.copy(s.pos).setY(s.pos.y + 2.0), _fd, R + 2.7 + W.off);
+      if (!above || Math.abs(above.normal.y) > 0.5) continue; // nothing above: that is the top (hop / vault instead)
+      n.copy(far.normal).setY(0).normalize();
+      const dcur = (s.pos.x - far.point.x) * n.x + (s.pos.z - far.point.z) * n.z;
+      W.off = Math.max(0, dcur - (R + 0.02));
+      W.point.set(far.point.x + n.x * W.off, s.pos.y, far.point.z + n.z * W.off);
+      return true;
+    }
+    return false;
   }
   function wallBasis(n, right) {
     cam.rightFlat(right); right.addScaledVector(n, -right.dot(n));
@@ -1142,7 +1222,7 @@ export function createTraversal({ world, cam, web, rig, camera }) {
     if (Math.abs(vx) > 0.5) {
       const side = _v2.copy(right).multiplyScalar(Math.sign(vx));
       const hit = world.raycast(s.pos, side, R + 0.25);
-      if (hit && Math.abs(hit.normal.y) < 0.5 && hit.normal.dot(side) < -0.7) {
+      if (hit && Math.abs(hit.normal.y) < 0.5 && hit.normal.dot(side) < -0.7 && deepSide(n, side)) { // (user r-wallrun) fins / bars: run over
         const n1 = hit.normal.clone().setY(0).normalize();
         startCornerWrap(n1, hit.point.clone().addScaledVector(n1, R + 0.02).setY(s.pos.y), 0.22, n.clone(), Math.sign(vx)); return;
       }
@@ -1152,10 +1232,10 @@ export function createTraversal({ world, cam, web, rig, camera }) {
     if (vyIn + W.runV > 0.5 || vy > 0.5) {
       const o = _v.copy(s.pos).addScaledVector(n, -(R + 0.25)); o.y = feetY() + 2.4;
       const top = world.raycast(o, _v2.set(0, -1, 0), 2.4);
-      if (top && top.normal.y > 0.5 && top.point.y - feetY() < 1.35) { if (startWallHop(n.clone(), fast || W.fast)) return; }
+      if (top && top.normal.y > 0.5 && top.point.y - feetY() < 1.35 && realTop(n, top.point.y)) { if (startWallHop(n.clone(), fast || W.fast)) return; }
     }
     // stay attached: probe the wall at chest and knee height
-    const probe = (oy) => world.raycast(_v.copy(s.pos).setY(s.pos.y + oy), _v2.copy(n).negate(), R + 0.9);
+    const probe = (oy) => world.raycast(_v.copy(s.pos).setY(s.pos.y + oy), _v2.copy(n).negate(), R + 0.9 + W.off);
     let hit = probe(0.35);
     if (!hit || Math.abs(hit.normal.y) > 0.5) hit = probe(-0.5);
     if (hit && Math.abs(hit.normal.y) < 0.5) {
@@ -1164,11 +1244,15 @@ export function createTraversal({ world, cam, web, rig, camera }) {
       // effective wall plane = the most protruding surface over the whole body/stride extent (sills, cornices, piers):
       // limbs planted on the wall must never sink into a protrusion the chest probe missed (user feedback #5)
       const bx = hit.point.x, bz = hit.point.z;
-      const prot = Math.min(0.12, wallProtrusion(n, bx, bz, right, false));
-      W.off = prot > W.off ? prot : damp(W.off, prot, 10, h);
+      // (user r-wallrun) look ahead along the run (sideways / up / diagonal) so fins, bars, piers, sills and cornices up
+      // to 1 m deep are run OVER (the surface lifts before he reaches them) instead of wrapped round or stopping him
+      const prot = Math.min(2.2, wallProtrusion(n, bx, bz, right, true, vx, vy));
+      W.off = prot > W.off ? Math.min(prot, W.off + 16 * h) : damp(W.off, prot, 8, h);
       const off = R + 0.02 + W.off;
       s.pos.x = bx + n.x * off; s.pos.z = bz + n.z * off;
       W.point.set(bx + n.x * W.off, s.pos.y, bz + n.z * W.off); W.dist = R + 0.02;
+    } else if (setbackStep(n, vy)) {
+      // (user r-wallrun) terrace / setback ledge (the facade steps back <= 2.2 m and carries on up): stepped over
     } else {
       // outer corner: wrap around it (checked first when moving sideways — a side run must carry round the corner)
       if (Math.abs(vx) > 0.5 && Math.abs(vx) >= Math.abs(vy)) {
@@ -1184,7 +1268,7 @@ export function createTraversal({ world, cam, web, rig, camera }) {
       if (vy > -0.5) {
         const o = _v.copy(prev).addScaledVector(n, -(R + 0.7)); o.y += 2.4;
         const top = world.raycast(o, _v2.set(0, -1, 0), 5.5);
-        if (top && top.normal.y > 0.5 && startWallHop(n.clone(), fast || W.fast)) return;
+        if (top && top.normal.y > 0.5 && realTop(n, top.point.y) && startWallHop(n.clone(), fast || W.fast)) return;
       }
       if (s.sub === 'wallZip' && s.zip.target.y > s.pos.y + 0.5) return; // user r9z: a recess mid-pull (window, setback) never drops him off / back into a run
       // outer corner: wrap around it
@@ -1226,27 +1310,35 @@ export function createTraversal({ world, cam, web, rig, camera }) {
   }
   // how far (m, >= 0) any wall surface within the body's extent sticks out past the base wall point (bx, bz)
   const PROBE_Y = [-0.88, -0.45, 0.05, 0.5, 0.85], PROBE_X = [-0.45, 0.45];
-  function wallProtrusion(n, bx, bz, right, side) {
+  function wallProtrusion(n, bx, bz, right, side, vx = 0, vy = 0) {
     let best = 0; const dn = _v2.copy(n).negate();
     const test = (ox, oy) => {
-      const o = _v.set(bx + n.x * 0.75 + right.x * ox, s.pos.y + oy, bz + n.z * 0.75 + right.z * ox);
-      const hit = world.raycast(o, dn, 1.6);
+      const o = _v.set(bx + n.x * 1.15 + right.x * ox, s.pos.y + oy, bz + n.z * 1.15 + right.z * ox);
+      const hit = world.raycast(o, dn, 2.0);
       if (!hit || Math.abs(hit.normal.y) > 0.6) return;
       const d = (hit.point.x - bx) * n.x + (hit.point.z - bz) * n.z;
-      if (d > best && d < 0.7) best = d;
+      if (d > best && d < 2.2) best = d;
     };
     for (const oy of PROBE_Y) test(0, oy);
     if (side) for (const ox of PROBE_X) for (const oy of [-0.6, 0.3]) test(ox, oy);
+    // (user r-wallrun) look-ahead along the travel direction (lead grows with speed: ~0.15 s ahead + half a body)
+    const sp = Math.hypot(vx, vy);
+    if (side && sp > 1) {
+      const lead = 0.4 + sp * 0.15, ux = vx / sp, uy = vy / sp;
+      for (const f of [0.35, 0.7, 1]) for (const o of [-0.5, 0, 0.5]) test(ux * lead * f - uy * o * 0.4, uy * lead * f + ux * o * 0.9);
+    }
     return best;
   }
   // dir1 = travel direction along the new face, mx = the lateral key held (for the direction lock).
   // A fast side run (user r9) wraps at running speed and keeps the run cycle (sub stays wallRunSide): seamless.
   function startCornerWrap(n1, p1, dur, dir1, mx) {
-    const W = s.wall, run = W.fast && s.sub === 'wallRunSide';
+    const W = s.wall, run = W.fast && (s.sub === 'wallRunSide' || s.sub === 'wallRun'); // (user r-wallrun) any running direction wraps at speed (a diagonal run was dropped into the cling wrap)
     const mid = s.pos.clone().lerp(p1, 0.5).addScaledVector(W.normal, 0.35).addScaledVector(n1, 0.35);
     const sp = s.vel.length();
     if (run) dur = clamp((s.pos.distanceTo(mid) + mid.distanceTo(p1)) / Math.max(sp, 6), 0.1, 0.3);
-    s.kin = { type: 'cornerWrap', t: 0, dur, p0: s.pos.clone(), p1: mid, p2: p1, n0: W.normal.clone(), n1, run, sp, dir1 };
+    const vy = run ? s.vel.y : 0; // (user r-wallrun) a diagonal run keeps climbing through the wrap
+    if (vy) { mid.y += vy * dur * 0.5; p1 = p1.clone(); p1.y += vy * dur; }
+    s.kin = { type: 'cornerWrap', t: 0, dur, p0: s.pos.clone(), p1: mid, p2: p1, n0: W.normal.clone(), n1, run, sp, dir1, sub: s.sub };
     if (dir1 && mx) { W.lockDir = dir1.clone(); W.lockMx = mx; }
     if (!run) setSub('cornerWrap');
     events.push({ type: 'cornerWrap', run });
@@ -1417,7 +1509,7 @@ export function createTraversal({ world, cam, web, rig, camera }) {
       s.kin = null;
       if (k.type === 'cornerWrap') {
         s.wall.normal.copy(k.n1);
-        if (k.run && k.dir1) { s.vel.copy(k.dir1).multiplyScalar(k.sp); setSub('wallRunSide'); } else setSub('crawl');
+        if (k.run && k.dir1) { s.vel.copy(k.dir1).multiplyScalar(k.sp); setSub(k.sub === 'wallRun' ? 'wallRun' : 'wallRunSide'); } else setSub('crawl');
       }
       else if (k.type === 'vault') {
         s.floorY = floorAt(s.pos.x, s.pos.z, feetY() + 0.3); s.pos.y = s.floorY + H;

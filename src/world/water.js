@@ -142,6 +142,7 @@ export function createRiverMaterial(T, refl = null, { ssr = false, body = [0.06,
           vec3 rvW = transformDirectionByInverseViewMatrix(reflect(-geometryViewDir, normal), viewMatrix);
           rvW.y = abs(rvW.y) * 0.8 + 0.1;
           radiance = textureCubeUV(envMap, envMapRotation * normalize(rvW), material.roughness).rgb * envMapIntensity;
+          radiance *= mix(0.3, 1.0, ambData.bounce.w); // (night) the night sky mirror stays dim: dark water with the city's light streaks (critic r2: rivers brighter than the city)
         }
         #endif
         if (uReflOn > 0.5 && vRefl.w > 0.0) {

@@ -9,6 +9,7 @@
 import { nightK, dnTime } from '../render/daynight.js'; // (daynight)
 import { glassMirrorShared, GLSL_GLASS_MIRROR_DECL } from '../render/glassmirror.js'; // (render r-refl) player / web / near peds in the glass
 import * as THREE from 'three';
+import { cityLights } from '../render/citylights.js'; // (night) shop fronts light the sidewalk
 
 export const STYLE = { BLANK: 0, PUNCHED: 1, CURTAIN: 2, RIBBON: 3, DECO: 4, PARTY: 5, ARCH: 6 }; // ARCH: Chrysler-like crown tier (skyline)
 export const LAYER = { RED: 0, BROWN: 1, BUFF: 2, LIME: 3, CONCRETE: 4, METAL: 5, GRANITE: 6, WHITE: 7, ROOF: 8, ROOF_GRAVEL: 9, ROOF_MEMBRANE: 10, ROOF_PAVERS: 11, ROOF_GREEN: 12, TERRA: 13, STUCCO: 14, RED2: 15 }; // (textures r2) 13-15: terracotta, stucco, 2nd red brick (hao layer 16 = grime/leak decal sheet)
@@ -26,6 +27,209 @@ class GrowBuf {
   }
   take() { return this.a.slice(0, this.length); }
 }
+// (night) every storefront frontage (facade shader 'storefront zone') is a real warm rect light facing the street
+// (citylights.js), so lit shops light the sidewalk, people and parked cars. One rect per frontage spanning its open
+// (unshuttered, not closed-for-the-night) bays, radiance x their share; same per-bay hash as the shader (fh1 in float32).
+const f32 = Math.fround, fr = (x) => f32(x - Math.floor(x));
+function fh1js(x, y) {
+  let px = fr(f32(f32(x) * f32(123.34))), py = fr(f32(f32(y) * f32(456.21)));
+  const d = f32(f32(px * f32(px + f32(45.32))) + f32(py * f32(py + f32(45.32))));
+  px = f32(px + d); py = f32(py + d);
+  return fr(f32(px * py));
+}
+// (night) mirror of the shader's integer hash (nhu / nh3 / nh01)
+const nhu = (x) => { x = (x ^ (x >>> 16)) >>> 0; x = Math.imul(x, 0x7feb352d) >>> 0; x = (x ^ (x >>> 15)) >>> 0; x = Math.imul(x, 0x846ca68b) >>> 0; return (x ^ (x >>> 16)) >>> 0; };
+const nh3 = (a, b, c) => nhu((Math.imul(a >>> 0, 73856093) ^ nhu((Math.imul(b >>> 0, 19349663) ^ nhu(Math.imul(c >>> 0, 83492791) >>> 0)) >>> 0)) >>> 0);
+const nh01 = (h) => (h >>> 8) / 16777216;
+const shopSeen = new Set();
+export const SHOP_FRONTS = []; // (night) every storefront frontage (neon.js places signs from it; same bays / hash as the shader)
+export const SHOP_LIGHT = { radiance: 0.2, /* (night r10) 0.35: with the additive night GI the sidewalks overshot 2x (critic r9) */ range: 12, n: 0, pos: [], ids: [] }; // pos / ids: debug (x, y, z per rect; city-light ids)
+function registerShop(corner, T, W, N, p, gH) {
+  if (gH < 3.2 || W < 2.5) return;
+  const key = `${Math.round(corner[0] * 10)},${Math.round(corner[2] * 10)},${Math.round(T[0] * 100)},${Math.round(T[2] * 100)},${Math.round(W * 10)}`;
+  if (shopSeen.has(key)) return; shopSeen.add(key);
+  SHOP_FRONTS.push({ corner, T, N, W, gH, baseY: p.baseY ?? 0, seed: p.seed ?? 0, resid: !!p.resid, topY: p.topY ?? 0 }); // (night) read-only frontage list for neon.js
+  const seed = f32(p.seed ?? 0), fw = f32(W);
+  const nb = Math.max(1, Math.floor(W / 6.5 + 0.5)), bw = W / nb;
+  let u0 = -1, u1 = -1, on = 0;
+  for (let i = 0; i < nb; i++) {
+    const rnd = fh1js(f32(i + f32(seed * f32(13.1))), f32(f32(seed * f32(7.7)) + fw));
+    if (rnd >= 0.78 || fr(f32(rnd * f32(37.1))) < 0.2) continue; // shutter / closed
+    if (u0 < 0) u0 = i * bw; u1 = (i + 1) * bw; on++;
+  }
+  if (!on) return;
+  const span = u1 - u0, share = on * bw / span, uc = (u0 + u1) / 2;
+  const y0 = (p.baseY ?? 0) + 0.55, y1 = (p.baseY ?? 0) + gH - 1.55;
+  const h = y1 - y0; if (h < 1) return;
+  SHOP_LIGHT.ids.push(cityLights.add({ type: 'rect', pos: [corner[0] + T[0] * uc + N[0] * 0.08, (y0 + y1) / 2, corner[2] + T[2] * uc + N[2] * 0.08],
+    dir: N, u: T, width: span - 0.7, height: h, color: [1.0, 0.8, 0.6], intensity: SHOP_LIGHT.radiance * Math.min(1, share),
+    range: SHOP_LIGHT.range, radius: 0.5, volume: 0.15 }));
+  SHOP_LIGHT.n++; SHOP_LIGHT.pos.push(Math.round(corner[0] + T[0] * uc), Math.round((y0 + y1) / 2 * 10) / 10, Math.round(corner[2] + T[2] * uc));
+}
+// (night) landmark crown floodlights, evaluated in the facade shader at every distance (the city-light grid only spans
+// +-256 m around the camera): addCrownFlood(box {x0,z0,x1,z1}, y0 terrace, y1 top, color [r,g,b], gain, reach m)
+const NFLOOD = 12;
+const floodU = { uFl: { value: Array.from({ length: NFLOOD * 3 }, () => new THREE.Vector4()) }, uFlBB: { value: new THREE.Vector4(0, 0, 0, 0) }, uFlY: { value: new THREE.Vector2(1e9, 0) } };
+export function addCrownFlood(b, y0, y1, color, gain, reach = 10, pad = 1.2, streak = 0) {
+  const n = floodU.uFlY.value.y; if (n >= NFLOOD) return;
+  const V = floodU.uFl.value;
+  V[n * 3].set(b.x0, b.z0, b.x1, b.z1); V[n * 3 + 1].set(y0, y1, reach, pad); V[n * 3 + 2].set(color[0] * gain, color[1] * gain, color[2] * gain, streak);
+  const B = floodU.uFlBB.value;
+  if (!n) B.set(b.x0 - pad, b.z0 - pad, b.x1 + pad, b.z1 + pad);
+  else B.set(Math.min(B.x, b.x0 - pad), Math.min(B.y, b.z0 - pad), Math.max(B.z, b.x1 + pad), Math.max(B.w, b.z1 + pad));
+  floodU.uFlY.value.set(Math.min(floodU.uFlY.value.x, y0), n + 1);
+}
+// (night) LIGHT FROM INSIDE THE BUILDINGS (user: 'light coming from inside buildings doesn't illuminate external
+// objects'). Every window facade quad is recorded at build time (16 floats, 64 m buckets). A city-light provider picks
+// the faces within WL.R of the camera and emits rect lights for their LIT windows with the same night window model as
+// the facade shader (same per-floor / per-window hashes -> same lit windows, colours, brightness): near the camera one
+// rect per run of adjacent lit windows on a floor (sills, fire escapes, AC units, the player on the wall, the facade
+// across a narrow street get the light of the actual windows), further out one rect per 3-floor band carrying that
+// band's mean window emission. Dark floors emit nothing. Candidate list rebuilt when the camera moves > 2.5 m; <= WL.max.
+export const WL = { max: 320, R: 170, near: 38, K: 2.0 /* (night r10) 0.8: the light was far dimmer than the visible window (sills / reveals barely lit, critic r9) */, range: 11, faces: 0, emitted: 0, enabled: true };
+const WF = new GrowBuf(Float32Array, 1 << 16), WB = new Map();
+const WFN = 17;
+function recordWinFace(corner, T, W, y0, y1, N, p, style, gH, uOff) {
+  const i = WF.length / WFN;
+  WF.push(corner[0], corner[2], T[0], T[2], W, y0, y1, p.floorH ?? 3.3, p.bayW ?? 2.4, p.winW ?? 0.5, p.winH ?? 0.55,
+    p.margin ?? 0.6, p.seed ?? 0, style + 8 * (p.resid ? 1 : 0), Math.abs(gH), p.baseY ?? 0, (p.topY ?? 100) + 1e4 * uOff);
+  const cx = corner[0] + T[0] * W / 2, cz = corner[2] + T[2] * W / 2, k = (Math.floor(cx / 64) + 4096) * 8192 + Math.floor(cz / 64) + 4096;
+  let b = WB.get(k); if (!b) WB.set(k, b = []); b.push(i);
+  WL.faces++;
+}
+// per-face cache: [bands] each { y0, y1, d? , band: [u0,u1,y,h,r,g,b] | null, runs: Float32Array(7 * n) }
+const wCache = new Map();
+const LIN = (r, g, b, o) => { o[0] = r; o[1] = g; o[2] = b; return o; };
+function faceBands(fi) {
+  let c = wCache.get(fi); if (c) return c;
+  const o = fi * WFN, A = WF.a;
+  const W = A[o + 4], qy0 = A[o + 5], qy1 = A[o + 6], fh = A[o + 7], bayW = A[o + 8], winW = A[o + 9], winH = A[o + 10];
+  const margin = A[o + 11], seed = f32(A[o + 12]), st = A[o + 13] % 8, resid = A[o + 13] >= 8, gH = A[o + 14], baseY = A[o + 15];
+  const uOff = Math.round(A[o + 16] / 1e4), topYa = A[o + 16] - 1e4 * uOff;
+  const curtain = st === 2, ribbon = st === 3, deco = st === 4, office = curtain || ribbon || deco;
+  const usable = W - 2 * margin; // (the shader's u spans the whole face; chunks of one face share it via uOff)
+  const nbAll = Math.max(1, Math.floor((usable) / bayW + 0.5)), bw = usable / nbAll, ww = bw * winW, wh = fh * winH;
+  const wy0 = (fh - wh) * (curtain ? 0.72 : 0.42), topY = topYa - baseY, maxYY = topY - gH - (curtain ? 0.2 : 1.2);
+  const busy = 0.5 + fr(seed * 3.77 + 0.21), gdiv = 3 + Math.floor(fr(seed * 5.3) * 6);
+  const fl0 = Math.max(0, Math.floor((qy0 - baseY - gH) / fh)), fl1 = Math.floor((qy1 - baseY - gH) / fh);
+  const bands = [], col = [0, 0, 0];
+  for (let b0 = fl0; b0 <= fl1; b0 += 3) {
+    const runs = []; let sr = 0, sg = 0, sb = 0, nLit = 0, yb0 = 1e9, yb1 = -1e9;
+    for (let fl = b0; fl < Math.min(b0 + 3, fl1 + 1); fl++) {
+      const yyc = fl * fh + wy0 + wh / 2, yc = baseY + gH + yyc; // window centre
+      if (yc < qy0 || yc >= qy1 || fl * fh + wy0 + wh > maxYY + 0.01 || yyc < 0) continue;
+      yb0 = Math.min(yb0, yc - wh / 2); yb1 = Math.max(yb1, yc + wh / 2);
+      const sdI = Math.floor(seed * 1000 + 0.5) >>> 0, flR = nh01(nh3(fl, sdI, 11));
+      let pF = 0, pP = 0, full = false, part = false, fc = null, flB = 1, pwR = 0;
+      if (office) {
+        pF = (deco ? 0.42 : 0.36) * busy; pP = 0.18 * busy; full = flR <= pF; part = !full && flR <= pF + pP;
+        const fq = fr(flR * 53.7), k = deco ? 1 : 0.7;
+        fc = fq < 0.5 ? [0.8, 0.92, 1] : fq < 0.84 ? [1, 0.93, 0.8] : [1, 0.74, 0.48];
+        fc = fc.map(v => v * k); if (deco) fc = fc.map((v, j) => v + ([1, 0.9, 0.74][j] - v) * 0.35);
+        flB = 0.55 + 0.45 * fr(flR * 29.3);
+        if (!full && !part && busy < 2) { /* dark floor: only ~3 % strays */ }
+      } else pwR = 0.25 * busy * (0.6 + 0.8 * fr(flR * 3.3));
+      let run = null;
+      const flush = () => { if (run) { runs.push(run); run = null; } };
+      for (let bi = 0; bi < nbAll; bi++) {
+        const u = margin + (bi + 0.5) * bw - uOff; // centre in this quad's local u (the shader's u = local + uOff)
+        if (u < 0 || u > W) { flush(); continue; }
+        const wR = nh01(nh3(bi, fl, sdI + 23)), wR2 = nh01(nh3(bi, fl, sdI + 57));
+        let on = false;
+        if (office) {
+          const gR = nh01(nh3(Math.floor(bi / gdiv), fl, sdI + 91));
+          on = wR <= (full ? (gR < 0.18 ? 0.1 : 0.8) : part ? (gR <= 0.45 ? 0.85 : 0) : 0.03);
+          if (on) { const m = flB * (0.6 + 0.4 * wR2); LIN(fc[0] * m, fc[1] * m, fc[2] * m, col); }
+        } else {
+          on = wR <= pwR;
+          if (on) {
+            if (wR2 >= 0.9) LIN(0.42 * 0.4, 0.56 * 0.4, 0.4, col);
+            else { const t = fr(wR2 * 7.9), m = 0.12 + 0.88 * Math.pow(fr(wR2 * 3.7), 1.4); LIN(m, (0.58 + 0.22 * t) * m, (0.28 + 0.28 * t) * m, col); }
+          }
+        }
+        if (!on) { flush(); continue; }
+        sr += col[0]; sg += col[1]; sb += col[2]; nLit++;
+        if (run) { run[1] = u + ww / 2; run[4] += col[0]; run[5] += col[1]; run[6] += col[2]; run[7]++; }
+        else run = [u - ww / 2, u + ww / 2, yc, wh, col[0], col[1], col[2], 1];
+      }
+      flush();
+    }
+    if (!nLit) continue;
+    // run rect radiance: mean window colour x glass share of the run; band: summed window emission over the band
+    const R = new Float32Array(runs.length * 7);
+    runs.forEach((r, j) => { const n = r[7], share = n * ww / Math.max(r[1] - r[0], ww); R.set([r[0], r[1], r[2], r[3], r[4] / n * share, r[5] / n * share, r[6] / n * share], j * 7); });
+    const bh = Math.max(yb1 - yb0, wh), a = ww * wh / (usable * bh);
+    bands.push({ y: (yb0 + yb1) / 2, band: [margin, W - margin, (yb0 + yb1) / 2, bh, sr * a, sg * a, sb * a], runs: R });
+  }
+  if (wCache.size > 30000) wCache.clear();
+  wCache.set(fi, bands);
+  return bands;
+}
+// candidate rects (rebuilt when the camera moves): flat pool of plain records, re-emitted every frame
+const wPool = [], wCand = []; let wN = 0, wCx = 1e9, wCy = 1e9, wCz = 1e9;
+const wRec = (i) => wPool[i] || (wPool[i] = { type: 'rect', pos: [0, 0, 0], dir: [0, 0, 1], u: [1, 0, 0], width: 1, height: 1, color: new THREE.Color(), intensity: 1, range: 10, radius: 0.4, volume: 0 });
+function setRect(i, fo, u0, u1, y, h, r, g, b) {
+  const A = WF.a, cx = A[fo], cz = A[fo + 1], tx = A[fo + 2], tz = A[fo + 3], uc = (u0 + u1) / 2, w = Math.max(0.3, u1 - u0);
+  const nx = -tz, nz = tx; // outward normal (FacadeBuilder: the face seen from outside runs along T: N = (-T.z, T.x))
+  const R = wRec(i);
+  R.pos[0] = cx + tx * uc + nx * 0.05; R.pos[1] = y; R.pos[2] = cz + tz * uc + nz * 0.05; // (night) just outside the wall plane (the core culls fragments behind a rect: a rect at the recessed glass lit nothing); the reveal / sill get the shader's own term
+  R.dir[0] = nx; R.dir[1] = 0; R.dir[2] = nz; R.u[0] = tx; R.u[1] = 0; R.u[2] = tz;
+  R.width = w; R.height = h; R.color.setRGB(r, g, b); R.intensity = WL.K; R.radius = 1.6; // soft source: no specular sparkle on the brick joints
+  R.range = Math.min(22, WL.range + 0.35 * Math.sqrt(w * h));
+}
+function rebuildWinCands(cam) {
+  const px = cam.position.x, py = cam.position.y, pz = cam.position.z, R = WL.R, A = WF.a;
+  wCand.length = 0;
+  for (let bx = Math.floor((px - R) / 64); bx <= Math.floor((px + R) / 64); bx++) for (let bz = Math.floor((pz - R) / 64); bz <= Math.floor((pz + R) / 64); bz++) {
+    const L = WB.get((bx + 4096) * 8192 + bz + 4096); if (!L) continue;
+    for (const fi of L) {
+      const o = fi * WFN, cx = A[o], cz = A[o + 1], tx = A[o + 2], tz = A[o + 3], W = A[o + 4];
+      // camera in front of the face? (lights only reach the outside)
+      const t = Math.max(0, Math.min(W, (px - cx) * tx + (pz - cz) * tz)), qx = cx + tx * t - px, qz = cz + tz * t - pz;
+      const front = -(px - cx) * tz + (pz - cz) * tx; // n = (-tz, tx)
+      const dh = Math.hypot(qx, qz); if (dh > R || (front < -WL.range && dh > 4)) continue;
+      const dyf = Math.max(0, A[o + 5] - py, py - A[o + 6]); if (dh * dh + dyf * dyf > R * R) continue;
+      for (const b of faceBands(fi)) { const dy = b.y - py, d = Math.sqrt(dh * dh + dy * dy); if (d < R) wCand.push(Math.floor(d) * 1e7 + fi, b); }
+    }
+  }
+  // sort band candidates by distance (pairs: key, band)
+  const idx = []; for (let i = 0; i < wCand.length; i += 2) idx.push(i);
+  idx.sort((a, b) => wCand[a] - wCand[b]);
+  wN = 0;
+  for (const i of idx) {
+    if (wN >= WL.max) break;
+    const key = wCand[i], b = wCand[i + 1], d = Math.floor(key / 1e7), fi = key - d * 1e7, fo = fi * WFN;
+    if (d < WL.near && b.runs.length / 7 <= WL.max - wN) { for (let j = 0; j < b.runs.length; j += 7) { const q = b.runs; setRect(wN++, fo, q[j], q[j + 1], q[j + 2], q[j + 3], q[j + 4], q[j + 5], q[j + 6]); } }
+    else { const q = b.band; setRect(wN++, fo, q[0], q[1], q[2], q[3], q[4], q[5], q[6]); }
+  }
+  wCx = px; wCy = py; wCz = pz; WL.emitted = wN;
+}
+cityLights.addProvider((emit, cam) => {
+  if (WL.enabled !== WL._en) { WL._en = WL.enabled; cityLights.invalidate?.(); } // (night r10) toggles take effect with the incremental light grid
+  if (!WL.enabled || !WL.faces) return;
+  const p = cam.position;
+  if (WL.dirty) cityLights.invalidate?.();
+  if (WL.dirty || Math.abs(p.x - wCx) + Math.abs(p.y - wCy) + Math.abs(p.z - wCz) > 2.5) { WL.dirty = false; rebuildWinCands(cam); } // dirty: re-read WL.K / range (tuning)
+  for (let i = 0; i < wN; i++) emit(wPool[i]);
+});
+WL.list = (n = 8) => wPool.slice(0, Math.min(n, wN)).map(r => ({ p: r.pos.map(v => +v.toFixed(1)), d: r.dir.map(v => +v.toFixed(2)), w: +r.width.toFixed(1), h: +r.height.toFixed(1), c: r.color.toArray().map(v => +v.toFixed(2)), rg: +r.range.toFixed(1) }));
+if (typeof window !== 'undefined') window.__winLights = WL;
+// debug / shot framing: a lit window run (>= minN windows) on a face within R of (x, z), centre height y0..y1
+export function findLitWindowRun(x, z, R = 120, y0 = 6, y1 = 30, minN = 2) {
+  const A = WF.a; let best = null;
+  for (let bx = Math.floor((x - R) / 64); bx <= Math.floor((x + R) / 64); bx++) for (let bz = Math.floor((z - R) / 64); bz <= Math.floor((z + R) / 64); bz++) {
+    for (const fi of WB.get((bx + 4096) * 8192 + bz + 4096) ?? []) {
+      const o = fi * WFN, d = Math.hypot(A[o] - x, A[o + 1] - z); if (d > R || (best && d > best.d)) continue;
+      for (const b of faceBands(fi)) for (let j = 0; j < b.runs.length; j += 7) {
+        const q = b.runs, n = Math.round((q[j + 1] - q[j]) / 1.2);
+        if (q[j + 2] < y0 || q[j + 2] > y1 || n < minN) continue;
+        const uc = (q[j] + q[j + 1]) / 2;
+        best = { d, pos: [A[o] + A[o + 2] * uc, q[j + 2], A[o + 1] + A[o + 3] * uc], n: [-A[o + 3], 0, A[o + 2]], t: [A[o + 2], 0, A[o + 3]], w: q[j + 1] - q[j], style: A[o + 13] % 8 };
+      }
+    }
+  }
+  return best;
+}
 export class FacadeBuilder {
   constructor() {
     this.pos = new GrowBuf(); this.nrm = new GrowBuf(); this.uv = new GrowBuf(); this.aF = new GrowBuf(); this.aS = new GrowBuf();
@@ -42,6 +246,8 @@ export class FacadeBuilder {
       this.uv.push(u + uOff, y);
       this.pushAttrs(p, style, gH, W);
     }
+    if (gH > 0 && style >= 1 && y0 <= (p.baseY ?? 0) + 0.6) registerShop(corner, T, W, N, p, gH); // (night)
+    if (!this.noLights && style >= 1 && style <= 4 && W > 2 && y1 - y0 > 2) recordWinFace(corner, T, W, y0, y1, N, p, style, gH, uOff); // (night) window light
     void up;
     this.idx.push(b, b + 1, b + 2, b, b + 2, b + 3);
     this.n += 4;
@@ -181,11 +387,37 @@ const FRAG_DECL = /* glsl */`
 uniform highp sampler2DArray tWallC; uniform highp sampler2DArray tWallN; uniform highp sampler2DArray tWallH; uniform sampler2D tDetail;
 uniform sampler2D tInterior; uniform sampler2D tSigns; uniform sampler2D tNoise;
 uniform float uInteriorGain; uniform float uShopGain; uniform float uNightK; uniform float uDnTime; // (daynight)
+// (night) landmark crown floodlights (addCrownFlood): per flood A = lit box x0,z0,x1,z1; B = y0 (terrace), y1, reach
+// (m), pad; C = rgb x gain. uFlBB: union box (x0, z0, x1, z1), uFlY: lowest y0, count
+uniform vec4 uFl[${NFLOOD * 3}]; uniform vec4 uFlBB; uniform vec2 uFlY;
+vec3 crownFlood(vec3 p, vec3 n) {
+  vec3 E = vec3(0.0);
+  if (uFlY.y < 0.5 || p.y < uFlY.x - 0.5 || p.x < uFlBB.x || p.z < uFlBB.y || p.x > uFlBB.z || p.z > uFlBB.w) return E;
+  for (int i = 0; i < ${NFLOOD}; i++) {
+    if (float(i) >= uFlY.y) break;
+    vec4 A = uFl[i * 3], B = uFl[i * 3 + 1], C = uFl[i * 3 + 2];
+    if (p.y < B.x - 0.3 || p.y > B.y || p.x < A.x - B.w || p.x > A.z + B.w || p.z < A.y - B.w || p.z > A.w + B.w) continue;
+    float h = B.z > 0.0 ? p.y - B.x : B.y - p.y; // reach < 0: spill falling off DOWNWARD from y1 (under a lit lip)
+    float rz = abs(B.z);
+    // fixtures on the terrace aimed up the face: brightest just above the setback, a long soft falloff, a scallop per
+    // fixture along the face (4 m pitch); soffits / ledge undersides catch it, terrace floors a little
+    float along = abs(n.x) > 0.5 ? p.z : p.x;
+    float sc = 0.8 + 0.2 * cos(along * 1.5708) * exp(-h / (0.6 * rz));
+    float f = (0.01 + 0.99 * exp(-h / rz)) * smoothstep(-0.3, 0.4, h) * sc; // (critic r1/r3) a 3-4 m up-light band at each setback lip, ~20 % by the next setback
+    if (C.w > 0.0) { float sp = max(cos(along * 6.2832 / C.w), 0.0); f *= 0.25 + 0.75 * sp * sp; } // (night) vertical flood streaks on the piers, dark mullions between (C.w = pitch m)
+    E += C.rgb * f * (abs(n.y) < 0.5 ? 1.0 : (n.y < 0.0 ? 0.9 : 0.3));
+  }
+  return E;
+}
 varying vec2 vFac; flat varying vec4 vF; flat varying vec4 vS; flat varying vec4 vW; flat varying vec4 vX; flat varying vec3 vTint;
 varying vec3 vWPos; varying vec3 vWN;
 
 float fh1(vec2 p) { p = fract(p * vec2(123.34, 456.21)); p += dot(p, p + 45.32); return fract(p.x * p.y); }
 float fh1b(vec3 p) { return fh1(p.xy + p.z * 17.13); }
+// (night) integer hash (lowbias32), mirrored bit-exactly in JS (nh3js): lit-window decisions shared with the window-light provider
+uint nhu(uint x) { x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; x ^= x >> 16; return x; }
+uint nh3(uint a, uint b, uint c) { return nhu(a * 73856093u ^ nhu(b * 19349663u ^ nhu(c * 83492791u))); }
+float nh01(uint h) { return float(h >> 8) / 16777216.0; }
 float layerScale(float L) {
   if (L > 12.5) return L < 13.5 ? 3.0 : (L < 14.5 ? 3.0 : 1.8); // (textures r2) terracotta 8 rows / 3 m, stucco, red brick 2 (24 courses)
   return L < 2.5 ? 1.8 /* (street r10) 2.4 -> 1.8: finer brick (director: 'brick texel scale reads too big') */ : (L < 3.5 ? 3.0 : (L < 4.5 ? 4.0 : (L < 5.5 ? 3.0 : (L < 6.5 ? 2.0 : (L < 7.5 ? 2.4 : (L < 8.5 ? 8.0 : (L < 9.5 ? 4.0 : (L < 10.5 ? 8.0 : (L < 11.5 ? 8.0 : 4.0)))))))));
@@ -305,6 +537,8 @@ float pbox(float x, float p, float a, float b, float w) { w = max(w, 1e-4); retu
 vec3 gSpecTint = vec3(1.0); // coated-glass reflection tint (curtain walls)
 float gSash = 0.0; // (street r9) old masonry sash glass: lower grazing (F90) reflectance
 float gSashV = 1.0; // (street r11) per-window reflection strength of old sash glass (wavy / dusty / cleaned panes)
+float gAoT = 0.0; // (night) setback contact shade: the crown flood lights the un-shaded albedo (its band sits right there)
+float gBlN = 0.0, gCurN = 0.0, gAcN = 0.0, gCovN = 0.0; // (night) blind / curtain / AC-unit masks, far-LOD glass coverage
 vec2 gWob = vec2(0.0); // (skyline r5) low-frequency curtain-wall panel deflection (wavy, broken reflections at any range)
 
 // Interior mapping into a room box [0,rw]x[0,rh]x[-rd,0], entering at p (z=0) along dir (dir.z<0)
@@ -320,6 +554,7 @@ vec3 interior(vec2 p, vec3 dir, float rw, float rh, float rd, float tile, float 
   vec3 col;
   if (t == tz) {
     vec2 q = vec2(h.x / rw, h.y / rh);
+    if (shop > 0.5 && rw > 4.5) { float nT = floor(rw / 3.2 + 0.5); q.x = fract(h.x / rw * nT); } // (night) wide shop room: the shelving wall tiles every ~3 m
     q = clamp(q, 0.01, 0.99);
     col = textureLod(tInterior, vec2((tileUV.x + q.x) / 4.0, 1.0 - (tileUV.y + 1.0 - q.y) / 4.0), gLodI).rgb;
   } else if (t == ty) {
@@ -329,11 +564,19 @@ vec3 interior(vec2 p, vec3 dir, float rw, float rh, float rd, float tile, float 
       // ceiling tiles + recessed troffers (dim in daylight, soft-edged, fading with room depth so they sit on the ceiling)
       float pe = smoothstep(0.26, 0.2, abs(c.x - 0.5)) * smoothstep(0.22, 0.15, abs(fract(c.y * 2.0) - 0.5));
       col = vec3(0.72, 0.72, 0.7) * (0.75 + 0.25 * lit) + pe * lit * vec3(0.55, 0.53, 0.48) * (1.0 + shop) * (1.0 - 0.6 * c.y);
+      if (shop > 0.5) col *= mix(1.0, 0.5, uNightK); // (night) critic r3: shop ceilings clipped to white panels
     } else { // floor
       col = shop > 0.5 ? vec3(0.55, 0.52, 0.48) : (tile < 5.5 ? vec3(0.23, 0.24, 0.26) : vec3(0.36, 0.25, 0.17));
     }
   } else {
     col = textureLod(tInterior, vec2((tileUV.x + 0.5) / 4.0, 1.0 - (tileUV.y + 0.6) / 4.0), 7.0).rgb * (dir.x > 0.0 ? 0.8 : 0.7);
+    if (shop > 0.5) col *= mix(1.0, 0.5, uNightK); // (night) shop side walls: flat mip colour, keep them subordinate to the lit shelving
+    if (uNightK > 0.5) { // (night) side walls seen through lit windows at a grazing angle: real content (the tile's furniture /
+      // shelving mapped along the room depth, darker, mirrored) and a lamp-light falloff from the window wall, not a flat mip
+      vec2 sq2 = clamp(vec2(fract(-h.z / max(rd, 0.1) * 1.3), h.y / rh), 0.02, 0.98);
+      vec3 sc2 = textureLod(tInterior, vec2((tileUV.x + (dir.x > 0.0 ? sq2.x : 1.0 - sq2.x)) / 4.0, 1.0 - (tileUV.y + 1.0 - sq2.y) / 4.0), gLodI + 1.0).rgb;
+      col = sc2 * (dir.x > 0.0 ? 0.62 : 0.55) * (shop > 0.5 ? 0.8 : 1.0) * (0.75 + 0.35 * smoothstep(0.0, 1.0, h.y / rh));
+    }
     col *= mix(0.7, 1.0, clamp(h.y / rh, 0.0, 1.0));
   }
   col *= mix(1.0, 0.55, depth);
@@ -549,7 +792,7 @@ Surf facade() {
     s.alb = mix(s.alb, vec3(0.03, 0.034, 0.04), tri); s.rough = mix(s.rough, 0.08, tri); s.metal = mix(s.metal, 0.0, tri);
     s.emis = vec3(0.0);
     s.n = normalize(vec3(0.0, 0.3 * band - 0.4 * rim, 1.0));
-    s.emis = vec3(0.0); gGlass = tri; gF0 = 0.1;
+    s.emis = tri * vec3(0.85, 0.92, 1.0) * 1.6 * uNightK; gGlass = tri; gF0 = 0.1; // (night) the sunburst's triangular windows glow white (Chrysler crown)
     return s;
   }
   if (style > 4.5) { // ---- party wall: common brick (whatever the street face is), weathering, demolished-neighbour
@@ -635,6 +878,9 @@ Surf facade() {
       vec2 suv = vec2((fx2 - pier) / (bw2 - 2.0 * pier), (y - signY0) / (signY1 - signY0));
       vec3 sc = textureLod(tSigns, vec2(suv.x, 1.0 - (row + 1.0 - suv.y) / 16.0), clamp(log2(max(aw * 1024.0 / (bw2 - 2.0 * pier), ah * 128.0 / 1.0)), 0.0, 9.0)).rgb;
       s.alb = sc; s.rough = 0.45; s.metal = 0.0; s.n = vec3(0.0, 0.0, 1.0); s.emis = sc * 0.25 * uShopGain;
+#ifdef FAR_NIGHT
+      s.emis *= 1.0 - 0.8 * uNightK; // (night)
+#endif
       if (rnd > 0.8) { s = base; s.alb *= 0.8; } // no sign
     } else if (y < glassY0) { // bulkhead
       s = base; s.alb *= 0.55; s.rough = 0.4;
@@ -668,11 +914,19 @@ Surf facade() {
         float mull = max(1.0 - boxAA(mx, 0.05, mw - 0.05, aw), 1.0 - boxAA(gp.y, glassY0 + 0.06, signY0 - 0.06, ah));
         mull = max(mull, 1.0 - boxAA(abs(gp.y - (signY0 - 0.9)), 0.04, 9.0, ah));
         float door = step(rnd, 0.5) * boxAA(gp.x, 0.4, 1.5, aw) * step(gp.y, 2.6);
-        vec3 room = interior(vec2(mod(gp.x, mw), gp.y - glassY0), dirIn, mw, signY0 - glassY0 + 0.6, 5.0,
+        bool wideR = uNightK > 0.35; // (night) one room behind the whole shop window (the per-mullion 1.8 m rooms read as flat tan corridor walls)
+        vec3 room = interior(wideR ? vec2(gp.x, gp.y - glassY0) : vec2(mod(gp.x, mw), gp.y - glassY0), dirIn, wideR ? gw : mw, signY0 - glassY0 + 0.6, 5.0,
                              12.0 + floor(rnd * 4.0), 1.0, 1.0);
         float F = 0.04 + 0.96 * pow(1.0 - Vt.z, 5.0);
         Surf gl; gl.alb = vec3(0.02); gl.rough = 0.04; gl.metal = 0.0; gl.n = vec3(0.0, 0.0, 1.0);
         gl.emis = room * uShopGain * (1.0 - F);
+        // (night) warm lit shop interiors, not blown panels: x0.3 against the x4.5 night exposure, 3000-3500 K tint, and
+        // ~20 % of the open (unshuttered) shops closed for the night (dim security light). Same rule as registerShop()
+        // (JS), which lights the sidewalk with a rect light per frontage.
+        if (uNightK > 0.0) gl.emis *= mix(vec3(1.0), fract(rnd * 37.1) < 0.2 ? vec3(0.03, 0.032, 0.036) : vec3(0.24, 0.2, 0.15), uNightK); // (critic r3) -35 %
+#ifdef FAR_NIGHT
+        gl.emis *= 1.0 - 0.8 * uNightK; // (night) far shores: 1-3 km of lit shop bands summed into a warm tan haze band
+#endif
         Surf fr; fr.alb = rnd > 0.4 ? vec3(0.05, 0.05, 0.055) : vec3(0.35, 0.28, 0.18); fr.rough = 0.35; fr.metal = 0.8; fr.n = vec3(0, 0, 1); fr.emis = vec3(0.0);
         float fm = max(mull, door * 0.0);
         Surf rv = base; rv.alb *= 0.6; rv.n = vec3(gp.x < 0.0 ? 1.0 : (gp.x > gw ? -1.0 : 0.0), gp.y < glassY0 ? 1.0 : (gp.y > signY0 ? -1.0 : 0.0), 0.3);
@@ -742,6 +996,44 @@ Surf facade() {
   // (skyline r8) per-window variation survives into the far LOD while a window cell still spans >= ~1.5 px
   // (critic: 'one tiled window pattern per tower, no per-window light / blind variation, reads as wallpaper')
   float wv = 1.0 - smoothstep(0.5, 0.9, max(aw / bw, ah / fh));
+  // (night) window occupancy (refs/night esb_perch_night): a sparse, irregular mix. Office / deco towers light whole
+  // floors or one tenant's bay group (fluorescent / neutral LED / some warm), most floors dark with a few stray lights;
+  // homes / masonry a sparse per-window scatter of warm tungsten at very varied brightness (curtains, lamps deep in the
+  // room), a few blue TV glows. nOn / nCol: this window; nFlM / nBdM: the floor's / building's expected emission factor
+  // (used once windows / floors go sub-pixel: the far city averages out instead of shimmering)
+  float nOn = 0.0; vec3 nCol = vec3(1.0), nFlM = vec3(0.0), nBdM = vec3(0.0);
+  if (uNightK > 0.0) {
+    float busy = 0.5 + fract(seed * 3.77 + 0.21);                        // per-building activity 0.5 .. 1.5
+    // integer hashes (exactly reproducible in JS: the window-light provider emits light for the same lit windows); the
+    // bay index ignores the paired-sash split (a pair shares one bay: both lit or both dark)
+    uint sdI = uint(floor(seed * 1000.0 + 0.5)), flI = uint(int(fl)), biI = uint(int(floor(ux / (usable / nb))));
+    float flR = nh01(nh3(flI, sdI, 11u));
+    float wR = nh01(nh3(biI, flI, sdI + 23u)), wR2 = nh01(nh3(biI, flI, sdI + 57u));
+    if (curtain || ribbon || deco) {
+      float pF = (deco ? 0.42 : 0.36) * busy, pP = 0.18 * busy; // (critic r1) office towers ~45-60 % lit          // floor fully lit / one tenant's bays lit
+      uint gBI = biI / uint(3.0 + floor(fract(seed * 5.3) * 6.0));
+      float gR = nh01(nh3(gBI, flI, sdI + 91u));
+      float full = step(flR, pF), part = (1.0 - full) * step(flR, pF + pP);
+      float fOn = full > 0.5 ? 0.66 : (part > 0.5 ? 0.4 : 0.03);
+      nOn = step(wR, full > 0.5 ? (gR < 0.18 ? 0.1 : 0.8) : (part > 0.5 ? step(gR, 0.45) * 0.85 : 0.03)); // full floors: an odd dark bay group
+      float fq = fract(flR * 53.7);
+      vec3 fc = (fq < 0.5 ? vec3(0.8, 0.92, 1.0) : (fq < 0.84 ? vec3(1.0, 0.93, 0.8) : vec3(1.0, 0.74, 0.48))) * (deco ? 1.0 : 0.7); // half cool-white LED, the rest neutral / warm // (night) office floors: bright but not blown
+      if (deco) fc = mix(fc, vec3(1.0, 0.9, 0.74), 0.35);                // deco towers: warmer (ESB ref)
+      float flB = 0.55 + 0.45 * fract(flR * 29.3); // per-floor brightness
+      nCol = fc * flB * (0.6 + 0.4 * wR2);
+      nFlM = fc * flB * fOn * 0.8;
+      nBdM = vec3(0.93, 0.9, 0.84) * (pF * 0.66 + pP * 0.4 + 0.03) * 0.62;
+    } else {
+      float pw = 0.25 * busy * (0.6 + 0.8 * fract(flR * 3.3));
+      nOn = step(wR, pw);
+      float tv = step(0.9, wR2);
+      nCol = tv > 0.5 ? vec3(0.42, 0.56, 1.0) * 0.4 : mix(vec3(1.0, 0.58, 0.28), vec3(1.0, 0.8, 0.56), fract(wR2 * 7.9)) * mix(0.12, 1.0, pow(fract(wR2 * 3.7), 1.4));
+      nFlM = vec3(1.0, 0.68, 0.4) * pw * 0.5;
+      nBdM = vec3(1.0, 0.68, 0.4) * 0.25 * busy * 0.5;
+    }
+    float nsw = fract(sin(floor(uDnTime / (45.0 + 60.0 * cellR2) + cellR * 17.0) * 91.7 + cellR * 311.0) * 4375.5); // rooms switch on / off every ~1-2 min
+    if (nsw < 0.03) nOn = 1.0 - nOn;
+  }
   float cBl = step(0.72, cellR2) * min(1.0, (cellR2 - 0.72) * 4.0); // curtain wall: blinds drawn (fraction of the pane)
   // (skyline r12) critic: 'glass slab = one even grid top to bottom'. Tenant zones of 8-15 floors: each zone gets its own
   // glass body tone / reflectance and its own share of drawn blinds (different tenants, re-glazed floors)
@@ -823,6 +1115,7 @@ Surf facade() {
   bool resid = vX.x > 0.5;
   float tile = resid ? 6.0 + floor(cellR2 * 6.0) : floor(cellR2 * 6.0);
   float lit = step(0.55, fract(cellR * 7.13));
+  if (uNightK > 0.5) lit = nOn; // (night) lit rooms show their ceiling lights, the rest stay dark
   vec3 room = interior(vec2(gp.x, gp.y), dirIn, bw, fh, curtain ? 6.0 : 4.0, tile, lit, 0.0);
   float F = 0.04 + 0.96 * pow(1.0 - Vt.z, 5.0);
   Surf gl;
@@ -882,7 +1175,9 @@ Surf facade() {
     { float hs = smoothstep(0.55, 1.0, gq.y); gl.emis *= 1.0 - 0.5 * hs; } // (textures r4) lintel / soffit shadow over the upper glass: the opening reads recessed
     // blinds / curtains
     float blind = cellR > bThr ? (cellR - bThr) * (pOK ? 2.6 : 1.8) : 0.0;
+    blind *= mix(1.0, 0.45, uNightK); // (night) blinds mostly up: lit rooms show their interior, not a flat card
     float bl = step(1.0 - blind, gq.y);
+    gBlN = bl; // (night)
     vec3 bc = resid ? mix(vec3(0.85, 0.8, 0.7), vec3(0.6, 0.35, 0.3), step(0.8, cellR2)) : vec3(0.82, 0.82, 0.8);
     float slats = 0.85 + 0.15 * step(0.5, fract(gp.y * 25.0));
     if (pOK) bc *= 0.5; // (street r10) dusty blinds in shade, not glowing white
@@ -897,6 +1192,7 @@ Surf facade() {
       float cw2 = 0.18 + 0.2 * fract(cR4 * 41.0);
       float onL = gq.x < cw2 ? 1.0 : 0.0, onR = gq.x > 1.0 - cw2 ? 1.0 : 0.0;
       float cur = cSide > 1.5 ? max(onL, onR) : (cSide > 0.5 ? (fract(cR4 * 13.0) < 0.5 ? onL : onR) : 0.0);
+      gCurN = cur; // (night)
       vec3 cc = fract(cR4 * 7.7) < 0.35 ? vec3(0.62, 0.52, 0.4) : (fract(cR4 * 7.7) < 0.6 ? vec3(0.5, 0.22, 0.18) : (fract(cR4 * 7.7) < 0.8 ? vec3(0.3, 0.36, 0.42) : vec3(0.75, 0.72, 0.64)));
       float fold = 0.8 + 0.2 * sin(gp.x * 38.0);
       gl.alb = mix(gl.alb, cc * 0.5 * fold, cur); gl.rough = mix(gl.rough, 0.9, cur); gl.emis *= 1.0 - cur;
@@ -1078,6 +1374,7 @@ Surf facade() {
         float k = hit * (1.0 - lod);
         r.alb = mix(r.alb, ac.alb, k); r.rough = mix(r.rough, ac.rough, k); r.metal = mix(r.metal, ac.metal, k);
         r.n = normalize(mix(r.n, ac.n, k)); r.emis *= 1.0 - k; gGlass *= 1.0 - k;
+        gAcN = k; // (night)
       }
       // cast shadow on the sill / wall below and a thin condensate stain
       float shd = boxAA(fx, cx - 0.5 * acW, cx + 0.5 * acW + 0.1, aw) * boxAA(fy, wy0 - 0.45, wy0, ah) * (1.0 - hit);
@@ -1110,6 +1407,7 @@ Surf facade() {
       a.metal = cap * 0.85 + (1.0 - cap) * (1.0 - vis) * (spGl > 0.5 ? 0.3 : 0.5);
       gGlass = mix(gGlass, (1.0 - cap) * mix(spGl * 0.8, 1.0, vis), lod);
       a.emis = roomAvg * uInteriorGain * 0.25 * vis * (1.0 - cap) * (0.6 + 0.8 * lit);
+      gCovN = vis * (1.0 - cap) * (1.0 - 0.6 * cBl); // (night)
     } else {
       vec3 avgGlass = vec3(0.035, 0.038, 0.042);
       { // (skyline r8) per-window variation in the far LOD: blinds / curtains (same cellR rule as the near LOD), lit vs
@@ -1134,23 +1432,35 @@ Surf facade() {
       a.rough = mix(o.rough, 0.12, cov);
       gGlass = mix(gGlass, cov, lod);
       a.emis = (roomAvg * 0.25 * (0.4 + 1.2 * lit) + vec3(0.03, 0.036, 0.045)) * uInteriorGain * cov * (pOK ? 0.7 : (deco ? 0.5 : 1.0)); // (textures r4) pOK 0.45 -> 0.7 // (street r10) darker masonry windows; (skyline r11) deco too
+      gCovN = cov * (pOK ? 0.85 : 1.0); // (night)
     }
     r.alb = mix(r.alb, a.alb, lod); r.rough = mix(r.rough, a.rough, lod); r.metal = mix(r.metal, a.metal, lod);
     r.n = normalize(mix(r.n, a.n, lod)); r.emis = mix(r.emis, a.emis, lod);
   }
-  // (daynight) at night only a random fraction of the rooms is lit (warm tungsten / some cool LED), the rest go dim
-  if (uNightK > 0.0 && vWPos.y > 7.0) {
-    float nr = fract(cellR * 13.7 + cellR2 * 5.3);
-    float nsw = fract(sin(floor(uDnTime / (45.0 + 60.0 * cellR2) + cellR * 17.0) * 91.7 + cellR * 311.0) * 4375.5); // rooms switch on / off every ~1-2 min
-    vec3 nt = nr > 0.86 ? vec3(0.72, 0.88, 1.2) : vec3(1.15, 0.88, 0.6);
-    // (lighting2 r3) per-floor bands (night refs): office towers have whole floors lit (cool fluorescent) or dark,
-    // homes / masonry a denser random scatter (~60 % lit)
-    float flR = fh1(vec2(fl * 3.1 + seed * 7.7, seed * 2.9 + 0.37));
-    bool officeT = curtain || ribbon;
-    float nThr = officeT ? (flR > 0.9 ? -1.0 : (flR < 0.45 ? 0.95 : 0.62)) : (flR > 0.92 ? 0.2 : 0.6); // (lighting2 r4) critic: 70-80 % lit -> ~35-40 %
-    if (officeT && flR > 0.9) nt = mix(vec3(0.85, 0.95, 1.12), vec3(1.1, 0.95, 0.75), step(0.96, flR));
-    nt *= mix(vec3(1.0), vec3(1.12, 0.9, 0.7), step(0.6, fract(flR * 5.3))); // (lighting2 r4) colour temperature varies per floor
-    r.emis *= mix(vec3(1.0), (nr > nThr) != (nsw < 0.1) ? nt * (0.8 + 0.9 * fract(nr * 7.3)) : vec3(0.06), uNightK);
+  // (night) lit windows replace the day emission (whose fake sky-reflection floor + x4.5 night exposure turned every
+  // window into a lit pane). Near: the room seen through the glass (interior mapping with lit = nOn: ceiling lights,
+  // back wall), backlit blinds / curtains glow dimmer; dark rooms are nearly black glass. Far: exact glass coverage x
+  // this window's state, then the floor / building mean once windows / floors get sub-pixel (no shimmer).
+  if (uNightK > 0.0) {
+    const float nG = 0.5; // lit-room radiance scale (the night exposure is x4.5)
+    float glassM = open * inG * (1.0 - frame) * (1.0 - gAcN) * (1.0 - capW);
+    float bc2 = clamp(gBlN + gCurN, 0.0, 1.0);
+    // backlit blinds / curtains: slats + a glow gradient toward the lamp side, not a flat card
+    float slatN = 0.3 + 0.12 * step(0.5, fract(gp.y * 25.0)) + 0.18 * clamp(gq.y, 0.0, 1.0);
+    vec3 nearE = nOn > 0.5 ? (room * (1.0 - bc2) + vec3(slatN) * gBlN + vec3(0.2 * (0.8 + 0.2 * sin(gp.x * 38.0))) * gCurN) * nCol : room * 0.012;
+    vec3 perW = nOn > 0.5 ? nCol : vec3(0.012);
+    vec3 kM = mix(perW, mix(nFlM, nBdM, smoothstep(0.35, 0.8, ah / fh)), 1.0 - wv);
+    vec3 nE = mix(nearE * glassM, gCovN * 0.42 * kM, lod) * nG;
+    r.emis = mix(r.emis, nE, uNightK);
+    // (night) the lit room lights its own opening: jambs / head (the faked reveal inside the opening outline), the sill
+    // and the frame get ~20-30 % of the window radiance, a short falloff onto the sill course / wall under the opening
+    // (the rect lights of the provider sit on the wall plane: they light what stands in front, not this faked relief)
+    if (nOn > 0.5 && lod < 1.0) {
+      float sillM = inWx * boxAA(fy, wy0 - 0.45, wy0 + 0.02, ah) * (0.35 + 0.65 * smoothstep(wy0 - 0.45, wy0, fy)) * valid;
+      float halo = inWx * boxAA(fy, wy0 - 1.2, wy0 + wh + 0.3, ah) * valid * 0.04;
+      float revM = open * (1.0 - inG) + 0.6 * frame * open;
+      r.emis += r.alb * nCol * nG * 0.25 * (revM + 0.8 * sillM + halo) * (1.0 - lod) * uNightK; // ~20 % of the window radiance
+    }
   }
   if (uNightK > 0.0 && abs(vWN.y) > 0.6) r.emis *= 1.0 - uNightK; // (lighting2 r3) no 'windows' on roofs / flat tops (far-shore roofs glowed as a pale band at night)
   // (skyline r4) large-scale facade breakup on towers (not deco: those carry piers + tier cornices): a louvred
@@ -1181,6 +1491,7 @@ Surf facade() {
       louv = mix(louv, curtain ? capC : o.alb * 1.05, stile * 0.8);
       r.alb = mix(r.alb, louv, band); r.rough = mix(r.rough, 0.55, band); r.metal = mix(r.metal, curtain ? 0.6 : 0.2, band);
       r.n = normalize(mix(r.n, vec3(0.0, -0.3 * (1.0 - lod), 1.0), band)); // (skyline r9) blades slope down-out: no sky-blue glint from the street r.emis *= 1.0 - band; gGlass *= 1.0 - band;
+      r.emis *= 1.0 - band * uNightK; // (night) the line above only comments this out: no lit rooms behind louvre floors
       vec3 pc = mix(capC, vec3(0.62, 0.63, 0.63), step(0.62, fract(seed * 4.39 + 0.5)) * 0.4) * (0.85 + 0.3 * nz2.r);
       if (roundT && !curtain) pc = o.alb * vec3(1.1, 1.09, 1.07); // (skyline r9) cast-stone / concrete fins on masonry drums
       float pm = pierM * (1.0 - band);
@@ -1195,6 +1506,7 @@ Surf facade() {
     float dyT = vFac.y - tierY;
     float aoT = 0.36 * (1.0 - smoothstep(0.0, 4.5, dyT)) + 0.14 * (1.0 - smoothstep(0.0, 20.0, dyT));
     r.alb *= 1.0 - aoT; r.emis *= 1.0 - 0.6 * aoT; gGlass *= 1.0 - 0.5 * aoT;
+    gAoT = aoT; // (night)
   }
   return r;
 }
@@ -1206,6 +1518,7 @@ export function createFacadeMaterial(T) {
     tWallC: { value: T.wallsCol }, tWallN: { value: T.wallsNrm }, tWallH: { value: T.wallsHao }, tDetail: { value: T.detailNrm }, tInterior: { value: T.interiors },
     tSigns: { value: T.signs }, tNoise: { value: T.noise }, uInteriorGain: { value: 0.5 }, uShopGain: { value: 0.7 },
     uNightK: nightK, uDnTime: dnTime, // (daynight) shared night factor + clock (src/render/daynight.js)
+    ...floodU, // (night) crown floodlights
     ...glassMirrorShared, // (render r-refl)
   };
   mat.userData.uniforms = uniforms;
@@ -1219,7 +1532,7 @@ export function createFacadeMaterial(T) {
       .replace('#include <fog_vertex>', '#include <fog_vertex>\n' + VERT_MAIN);
     sh.fragmentShader = sh.fragmentShader
       .replace('#include <common>', '#include <common>\n' + FRAG_DECL + GLSL_GLASS_MIRROR_DECL)
-      .replace('#include <map_fragment>', 'Surf FS = facade(); diffuseColor.rgb = FS.alb;')
+      .replace('#include <map_fragment>', 'Surf FS = facade();\n#ifdef FAR_NIGHT\nFS.alb *= 1.0 - 0.8 * uNightK; // (night) far shores: dark silhouettes at night (critic r1: beige-peach masses read like dusk)\n#endif\ndiffuseColor.rgb = FS.alb;')
       .replace('#include <roughnessmap_fragment>', 'float roughnessFactor = FS.rough;')
       .replace('#include <metalnessmap_fragment>', 'float metalnessFactor = FS.metal;')
       .replace('#include <normal_fragment_maps>', `
@@ -1230,7 +1543,7 @@ export function createFacadeMaterial(T) {
           vec3 nw = normalize(Tw * FS.n.x + Bw * FS.n.y + Nw * FS.n.z);
           normal = normalize((viewMatrix * vec4(nw, 0.0)).xyz);
         }`)
-      .replace('#include <emissivemap_fragment>', '#include <emissivemap_fragment>\ntotalEmissiveRadiance += FS.emis;')
+      .replace('#include <emissivemap_fragment>', '#include <emissivemap_fragment>\ntotalEmissiveRadiance += FS.emis;\nif (uNightK > 0.0) totalEmissiveRadiance += FS.alb / max(1.0 - gAoT, 0.4) * (1.0 - 0.6 * FS.metal) * crownFlood(vWPos, normalize(vWN)) * uNightK; // (night) crown floods')
       .replace('#include <lights_physical_fragment>', '#include <lights_physical_fragment>\nmaterial.specularColor = mix(material.specularColor, vec3(gF0) * gSpecTint, clamp(gGlass, 0.0, 1.0));\nmaterial.specularF90 = mix(material.specularF90, 0.55, clamp(gGlass, 0.0, 1.0) * gSash); // (textures r4) 0.3 -> 0.55')
       // (skyline r2) glass reflects the CITY, not only the sky: the IBL cube is sky-only, so reflection rays that leave a
       // window below the local skyline hit a procedural reflected cityscape (per-tower hashed silhouette of neighbouring
@@ -1276,6 +1589,7 @@ export function createFacadeMaterial(T) {
           float dn = smoothstep(0.0, -0.06, Rw.y);
           cityC = mix(cityC, farC, dn * (1.0 - smoothstep(-0.12, -0.4, Rw.y)));
           cityC = mix(cityC, streetC, smoothstep(-0.4, -0.85, Rw.y));
+          cityC *= 1.0 - 0.85 * uNightK; // (night) the reflected neighbours / streets are dark masses at night (the horizon-glow tint turned far glass towers pale)
           cityC = mix(cityC, radiance, 0.24); // keep a hint of sky / haze in the reflected city (stylised, like the refs)
           radiance = mix(radiance, cityC, bldg * cg * (1.0 - 0.5 * smoothstep(0.35, 0.8, material.roughness)));
           radiance = mix(radiance, gmS.rgb, gmS.a); // (render r-refl)
@@ -1284,6 +1598,17 @@ export function createFacadeMaterial(T) {
       }
       #endif`);
   };
-  mat.customProgramCacheKey = () => 'city-facade-v18'; // (render r-refl) v18: glass mirror
+  mat.customProgramCacheKey = () => 'city-facade-v19-night'; // (render r-refl) v18: glass mirror
   return mat;
+}
+// (night) a variant of the facade material sharing its uniforms / shader but with extra defines, e.g. NO_CITYLIGHT for
+// the far shores (surface.js: the Manhattan street-light fill lit their facades as a flat tan band at night)
+export function deriveFacadeMaterial(base, defines) {
+  const m = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.8, metalness: 0 });
+  // own userData without the uniform handles: lighting.js scales uInteriorGain / uShopGain per material from a remembered
+  // base (a second material sharing the uniforms would re-read the boosted value and compound the night gain)
+  m.userData = { ...base.userData, uniforms: undefined }; m.onBeforeCompile = base.onBeforeCompile; m.defines = { ...(base.defines || {}), ...defines };
+  const key = base.customProgramCacheKey() + '|' + Object.keys(defines).join(',');
+  m.customProgramCacheKey = () => key;
+  return m;
 }

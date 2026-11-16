@@ -124,7 +124,7 @@ export function createProps(c) {
           const gy = ctx.world.groundHeight(pr.pos.x, pr.pos.z, pr.pos.y + 1);
           if (pr.pos.y <= gy) {
             pr.pos.y = gy;
-            if (Math.abs(pr.vel.y) > 3) { pr.vel.y *= -0.3; pr.vel.x *= 0.5; pr.vel.z *= 0.5; c.sfx('land', 0.3); }
+            if (Math.abs(pr.vel.y) > 3) { pr.vel.y *= -0.3; pr.vel.x *= 0.5; pr.vel.z *= 0.5; c.sfx('clatter', pr.kind); }
             else { pr.vel.set(0, 0, 0); pr.state = 'spent'; pr.g.rotation.x = Math.PI / 2; pr.g.rotation.z = 0; pr.pos.y = gy + pr.r; }
           }
         }

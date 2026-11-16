@@ -10,6 +10,7 @@ import { mulberry32, hash2, onLand, G } from './layout.js';
 import { farShoreHeight } from './farshore.js';
 
 import { REFL_LAYER } from './water.js';
+import { nightK } from '../render/daynight.js'; // (night)
 
 // skyline clusters on the hinterland: centre, radius, max height
 const CLUSTERS = [
@@ -108,13 +109,20 @@ export function buildHinterland({ scene, R0 = 4300, R1 = 17000 }) {
 function createHinterlandMaterial() {
   const mat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.9, metalness: 0 });
   mat.onBeforeCompile = (sh) => {
+    sh.uniforms.uNightK = nightK; // (night)
     sh.vertexShader = sh.vertexShader.replace('#include <common>', `#include <common>
-      attribute vec3 aWall; attribute vec3 aRoof; varying vec3 vHC; varying vec3 vHP; varying float vTop;`)
+      attribute vec3 aWall; attribute vec3 aRoof; varying vec3 vHC; varying vec3 vHP; varying float vTop; varying float vLit;`)
       .replace('#include <fog_vertex>', `#include <fog_vertex>
       vTop = normal.y > 0.5 ? 1.0 : 0.0; vHC = vTop > 0.5 ? aRoof : aWall;
-      vHP = (modelMatrix * instanceMatrix * vec4(transformed, 1.0)).xyz;`);
+      vHP = (modelMatrix * instanceMatrix * vec4(transformed, 1.0)).xyz;
+      { vec3 io = instanceMatrix[3].xyz; float lh = fract(sin(dot(io.xz, vec2(12.9898, 78.233))) * 43758.5453); // (night) per-building lit share
+        vLit = lh < 0.35 ? 0.0 : (lh < 0.93 ? (lh - 0.35) * 0.35 : 0.6 + (lh - 0.93) * 4.0); }`);
     sh.fragmentShader = sh.fragmentShader.replace('#include <common>', `#include <common>
-      varying vec3 vHC; varying vec3 vHP; varying float vTop;`)
+      varying vec3 vHC; varying vec3 vHP; varying float vTop; varying float vLit; uniform float uNightK;`)
+      // (night) distant boroughs: dark masses with a sparse warm window sparkle (per-building lit share: most dim, a
+      // few bright), no light on the roofs; sub-pixel by construction (per-instance constant), so it never shimmers
+      .replace('#include <emissivemap_fragment>', `#include <emissivemap_fragment>
+      if (uNightK > 0.0 && vTop < 0.5) totalEmissiveRadiance += vec3(1.0, 0.7, 0.42) * vLit * 0.06 * smoothstep(3.0, 9.0, vHP.y) * uNightK;`)
       .replace('#include <map_fragment>', `{
         vec3 c = vHC;
         if (vTop < 0.5) {
@@ -126,9 +134,9 @@ function createHinterlandMaterial() {
           c = mix(c, vec3(0.08, 0.09, 0.1), w * 0.85);
           c *= 0.65 + 0.35 * smoothstep(0.0, 12.0, vHP.y); // grimy base / contact darkening
         }
-        diffuseColor.rgb = c;
+        diffuseColor.rgb = c * (1.0 - 0.85 * uNightK); // (night) dark masses
       }`);
   };
-  mat.customProgramCacheKey = () => 'hinterland-v2';
+  mat.customProgramCacheKey = () => 'hinterland-v3-night';
   return mat;
 }

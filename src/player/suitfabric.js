@@ -14,6 +14,8 @@
 // Only active for the Advanced suit: game/systems/suits.js turns it off for Iron / Symbiote (setSuitFabric).
 import * as THREE from 'three';
 import { addShaderPatch } from '../render/materials.js';
+import { nightK } from '../render/daynight.js';
+import { cityAmbient } from '../render/citylights.js';
 
 const uniforms = {
   uFabOn: { value: 0 },
@@ -21,6 +23,8 @@ const uniforms = {
   // x: baked-map texels per UV unit (hex registration, cell pitch ~2.5 mm), y: knit tiles per UV unit (tile = 10 threads, ~1.2 mm),
   // z: detail normal strength, w: cavity (albedo) strength
   uFabP: { value: new THREE.Vector4(4096, 147, 0.85, 0.18) },
+  uFabNightK: nightK, // (night r12)
+  uCityAmbLo: cityAmbient.lo, uCityAmbHi: cityAmbient.hi, // (user r-amb) area ambient of the lit blocks around the player
 };
 let want = true, loaded = 0, readyRes;
 const fabOff = typeof location !== 'undefined' && new URLSearchParams(location.search).get('fabric') === '0'; // A/B: ?fabric=0 = raw GLB material
@@ -50,7 +54,7 @@ export function applySuitFabric(root) {
       .replace('#include <begin_vertex>', '#include <begin_vertex>\nvFabP = position;');   // bind-pose position: sticks to the body
     sh.fragmentShader = sh.fragmentShader
       .replace('#include <common>', `#include <common>
-uniform float uFabOn; uniform sampler2D uFabHex, uFabKnit; uniform vec4 uFabP;
+uniform float uFabOn, uFabNightK; uniform sampler2D uFabHex, uFabKnit; uniform vec4 uFabP; uniform vec3 uCityAmbLo, uCityAmbHi;
 varying vec3 vFabP;
 float fabHash(vec3 p) { p = fract(p * 0.3183099 + 0.1); p *= 17.0; return fract(p.x * p.y * p.z * (p.x + p.y + p.z)); }
 float fabNoise(vec3 x) { // value noise, -1..1
@@ -109,6 +113,20 @@ if (uFabOn > 0.5) {
   float ws = dot(fabW, vec4(1.0)) * (1.0 - smoothstep(0.2, 0.5, fabMetal));   // leave the metal web-shooter parts alone
   roughnessFactor = mix(roughnessFactor, dot(rr, fabW) / max(dot(fabW, vec4(1.0)), 1e-3), clamp(ws, 0.0, 1.0));
 }`)
+      // (night r12) user: 'none of the lights affect the player suit at all'. The night preset's sky fill (env x3, tuned
+      // so facades read) lit the suit evenly from every side and drowned the lamps / headlights / screens (city lights
+      // off changed the suit by ~15 %). At night the suit keeps ~35 % of that fill (any suit: outside uFabOn), so the
+      // local lights model it; the moon key and city lights are unchanged, by day nothing changes
+      // (only where the city lights compiled in: on 16-texture-unit GPUs the suit falls back without them, citylights.js)
+      // (user r-amb) + the AREA AMBIENT of the lit blocks around him (citylights.js cityAmbient: street bounce from below,
+      // a weaker share from above), on every GPU path (uniforms, no texture): a bright avenue lifts the whole suit even
+      // away from the nearest lamp, a dark side street adds ~nothing
+      .replace('#include <lights_fragment_maps>', `#include <lights_fragment_maps>
+#ifdef USE_CITYL
+iblIrradiance *= mix(1.0, 0.35, uFabNightK); radiance *= mix(1.0, 0.6, uFabNightK);
+#endif
+{ vec3 fabWN = transformDirectionByInverseViewMatrix(normal, viewMatrix);
+  irradiance += mix(uCityAmbLo, uCityAmbHi, 0.5 + 0.5 * fabWN.y) * (0.75 + 0.25 * (1.0 - abs(fabWN.y))); }`)
       .replace('#include <normal_fragment_maps>', `#include <normal_fragment_maps>
 #ifdef USE_NORMALMAP_TANGENTSPACE
 if (uFabOn > 0.5) {

@@ -20,6 +20,7 @@ export const ambShared = {
   bounce: new THREE.Vector4(0, 0, 0, 1),    // rgb: bounce irradiance (already x PI), w: daylight factor (1 day .. ~0 night)
   vert: new THREE.Vector4(1, 1, 0, 0),     // (lighting2 r6) x: sky-fill gain on VERTICAL / side-facing surfaces (facades, cars, props, trees in shade), y: street-bounce gain on them
   wx: new THREE.Vector4(0, 0, 0, 1),       // (lighting2 r3) weather: x wet amount (overcast rain: whole city wet + puddles), y clock (s), z rain intensity, w dry-weather puddles on/off (user r-nopuddles, Settings)
+  cgrid: new THREE.Vector4(0, 0, 512, 0),  // (night) city-light grid (citylights.js): xy origin (world x, z), z span, w on
   city: new THREE.Vector4(0, 0, 0, 0),     // (lighting2 r3) night city light: rgb sodium street-light irradiance (x PI) near the ground, w: Times Square screen spill
   shape: new THREE.Vector4(0.25, 1, 0, 0),  // w: (atmosphere r3) extra street-level bounce near the ground (x(1+w) at y=0, fades over ~26 m)  // x: bounce weight on up-facing surfaces (street canyon inter-reflection), y: skylight weight on up-facing,
                                             // z: (atmosphere r2) diffuse-only IBL gain (0 = 1): sky fill decoupled from the specular sky reflections
@@ -140,7 +141,7 @@ export function installSurfaceChunks(quality = {}) {
   const target = 'return PI * envMapColor.rgb * envMapIntensity;';
   if (env.includes(target) && !env.includes('ambData')) {
     SC.envmap_physical_pars_fragment = /* glsl */`
-struct AmbData { vec4 grade; vec4 bounce; vec4 shape; vec4 city; vec4 wx; vec4 vert; };
+struct AmbData { vec4 grade; vec4 bounce; vec4 shape; vec4 city; vec4 wx; vec4 vert; vec4 cgrid; };
 uniform AmbData ambData;
 ` + env.replace(target, /* glsl */`vec3 irr = PI * envMapColor.rgb * envMapIntensity;
 			float irrL = dot( irr, vec3( 0.2126, 0.7152, 0.0722 ) );
@@ -175,6 +176,7 @@ uniform AmbData ambData;
 				float lr = 0.7 + 0.3 * sin( cwp.x * 0.21 + 1.3 ) * sin( cwp.z * 0.19 );
 				// only the modelled city (the far shores / hinterland ground plates would light up as one glowing band)
 				float cfar = smoothstep( 2600.0, 1300.0, length( cwp.xz - cameraPosition.xz ) );
+				if ( ambData.cgrid.w > 0.0 ) { vec2 gq = abs( ( cwp.xz - ambData.cgrid.xy ) / ambData.cgrid.z * 2.0 - 1.0 ); cfar *= max( smoothstep( 0.8, 0.98, max( gq.x, gq.y ) ), 0.6 * smoothstep( 220.0, 420.0, length( cwp - cameraPosition ) ) ); } // far inside the grid only ~5 lights per pixel (LOD): keep part of the analytic glow (critic r2: only one avenue glows from above) // (night) inside the local-light grid the real lamps light the street (citylights.js); the analytic glow takes over at its edge
 				irr += ambData.city.rgb * ( exp( - cy / 4.5 ) * ( 0.45 + 0.55 * cup ) * lr + 0.12 * exp( - cy / 18.0 ) ) * cfar;
 				if ( ambData.city.w > 0.0 ) {
 					vec2 tq = cwp.xz;
@@ -186,7 +188,8 @@ uniform AmbData ambData;
 						vec3 tc = mix( c1, c2, 0.5 + 0.5 * sin( tq.x * 0.05 - tq.y * 0.031 ) );
 						tc = max( tc - 0.55 * min( tc.r, min( tc.g, tc.b ) ), 0.0 ) * 1.4; // (lighting2 r4) saturated magenta / cyan / amber spill, not white
 						float th = exp( - cy / 22.0 ) * ( 0.55 + 0.45 * cup ) + 0.35 * exp( - cy / 70.0 ) * ( 1.0 - cup );
-						irr += tc * ( ambData.city.w * inTS * th );
+						th += ambData.vert.w * 0.9 * smoothstep( 12.0, 35.0, cy ) * exp( - max( cy - 35.0, 0.0 ) / 60.0 ); /* (night r9) 1.6: upper facades read lavender, ref walls between screens are near-black */ // (night r5) roofs / ledges around the square bathed in the screens' colour (ts_perch ref: pink ledge)
+						irr += tc * ( ambData.city.w * inTS * th ) * ( 1.0 - ambData.vert.w * ( 1.0 - mix( 0.4, 0.35, smoothstep( 18.0, 40.0, cy ) ) ) ); /* (night r6) 40 % at street level too: warm-magenta plaza fill (critic: plazas ~45 % under the ref) */ // (night r5) above the street the analytic screen-colour field stays at 60%: roofs / upper facades around the square pick up the magenta glow (critic r4: TS perch roof black) // (night) real screen lights (screenlights.js) replace this analytic spill; city.w still drives the damp TS asphalt
 					}
 				}
 			}

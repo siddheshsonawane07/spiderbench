@@ -20,6 +20,7 @@ import { N8AOPostPass } from 'n8ao';
 import { FSPass, makeRT, GLSL_DEPTH, GLSL_COLOR, halton } from './common.js';
 import { GLSL_SKY_COMMON } from './sky.js';
 import { GpuProfiler } from './profiler.js';
+import { cityLights, cityLightsShared, cityLightsGLSL, CL_SLOTS } from './citylights.js'; // (night) local city lights: lit haze
 import { createGlassMirror } from './glassmirror.js'; // (render r-refl) player / cars / peds mirrored in facade glass
 
 export function createPipeline({ renderer, scene, camera, lighting }) {
@@ -62,6 +63,7 @@ export function createPipeline({ renderer, scene, camera, lighting }) {
   const dofHalfA = makeRT(W / 2, H / 2), dofHalfB = makeRT(W / 2, H / 2);
   const ssrRT = makeRT(W / 2, H / 2);       // rgb: (reflection - env) * confidence (signed, half float)
   const shaftRT = makeRT(W / 2, H / 2);     // rgb: sun in-scatter along the view ray (shadowed), a: linear depth
+  const cvolRT = makeRT(W / 4, H / 4); // (perf) quarter res: soft, low-frequency in-scatter (TAA + depth-aware upsample)      // (night) rgb: in-scatter of the city lights (lamps, screens, headlights) in the night haze, a: linear depth
   const sunVisRT = makeRT(1, 1, { filter: THREE.NearestFilter }); // r: sun visibility (lens flare)
   // auto exposure: r = adapted log2 luminance (ping-pong 1x1), g = this frame's metered value
   const aeRT = [makeRT(1, 1, { filter: THREE.NearestFilter, type: THREE.FloatType }), makeRT(1, 1, { filter: THREE.NearestFilter, type: THREE.FloatType })];
@@ -130,12 +132,12 @@ export function createPipeline({ renderer, scene, camera, lighting }) {
       uProj: { value: new THREE.Matrix4() }, uProjInv: { value: new THREE.Matrix4() }, uReversed: { value: reversed ? 1 : 0 },
       uCamWorld: { value: new THREE.Matrix4() }, uPrevViewProj: { value: new THREE.Matrix4() },
       uRes: { value: new THREE.Vector2(W, H) }, uFrame: { value: 0 }, uEnvI: { value: 1 }, uHavePrev: { value: 0 },
-      uMaxDist: { value: 220 },
+      uMaxDist: { value: 220 }, uFloor: { value: 0.5 },
     },
     fragmentShader: /* glsl */`
 precision highp float; in vec2 vUv; out vec4 fragColor;
 uniform sampler2D uDepth, uScene, uPrev; uniform mat4 uProj, uCamWorld, uPrevViewProj; uniform vec2 uRes;
-uniform float uFrame, uEnvI, uHavePrev, uMaxDist;
+uniform float uFrame, uEnvI, uHavePrev, uMaxDist, uFloor;
 ${GLSL_DEPTH}
 #define saturate(a) clamp(a, 0.0, 1.0)
 uniform sampler2D envMap;
@@ -214,7 +216,7 @@ void main() {
   vec3 hit = texture(uPrev, puv).rgb;
   // firefly / blow-out guard: never more than a few times brighter than the env reflection it replaces
   float le = dot(env, vec3(0.2126, 0.7152, 0.0722)), lh = dot(hit, vec3(0.2126, 0.7152, 0.0722));
-  hit *= min(1.0, (le * 3.0 + 0.5) / max(lh, 1e-4));
+  hit *= min(1.0, (le * 3.0 + uFloor) / max(lh, 1e-4)); // (night r12) uFloor 0.5 by day, ~0.06 at night: half-res mirrored headlights / lamps were bright blocky patches on the wet road (the city-light specular already draws their real reflection)
   // confidence: screen edges, rays toward the camera, grazing incidence (depth normals unreliable), distance
   vec2 e = smoothstep(0.0, 0.1, hs) * smoothstep(1.0, 0.9, hs);
   float graze = smoothstep(0.02, 0.12, -dot(V, N));
@@ -288,6 +290,90 @@ void main() {
 }`,
   });
 
+  // ---------------------------------------------------------------- (night) lit haze around the city lights (half res)
+  // Ray-march the view ray through the night haze (quadratic step spacing: dense near the camera) and, at each sample,
+  // add the in-scatter of the lights listed in the sample's city-light grid cell (citylights.js): halos around lamp
+  // heads, light cones under the street lamps and in front of headlights, coloured glow in front of the big screens.
+  // Jittered per pixel + frame; TAA integrates. Unshadowed (no local-light shadow maps), soft on purpose.
+  const cvol = new FSPass({
+    name: 'cityVolume',
+    defines: { NSEG: Q.cityVolSteps || 16, VSLOTS: Math.min(CL_SLOTS, 10), USE_CITYL: '', CITYL_NODITHER: '' },
+    uniforms: {
+      cityL: { value: cityLightsShared },
+      uDepth: { value: depthTex }, uProjInv: { value: new THREE.Matrix4() }, uReversed: { value: reversed ? 1 : 0 },
+      uCamWorld: { value: new THREE.Matrix4() }, uCamPos: { value: new THREE.Vector3() }, uFrame: { value: 0 },
+      uDensity: { value: 0.012 }, uHeightFall: { value: 1 / 40 }, uMaxT: { value: 120 }, uStrength: { value: 1 }, uG: { value: 0.55 },
+    },
+    // (night r9) ANALYTIC in-scatter (no ray-march noise: the jittered march read as a grid-like texture at the lamp heads).
+    // The view ray is cut into NSEG deterministic segments (short near the camera); for each segment the lights of the grid
+    // cell at its midpoint are integrated exactly over the segment for the inverse-square falloff:
+    //   int dt / (h^2 + (t - tc)^2) = ( atan((t1 - tc) / h) - atan((t0 - tc) / h) ) / h
+    // with the spot cone, range window and phase taken at 2 points of the segment.
+    fragmentShader: /* glsl */`
+precision highp float; precision highp int; precision highp usampler2D; in vec2 vUv; out vec4 fragColor;
+uniform sampler2D uDepth; uniform mat4 uCamWorld; uniform vec3 uCamPos; uniform float uFrame;
+uniform float uDensity, uHeightFall, uMaxT, uStrength, uG;
+${GLSL_DEPTH}
+${cityLightsGLSL}
+float phaseHG2(float mu, float g) { float g2 = g * g; return (1.0 - g2) / (12.566 * pow(max(1.0 + g2 - 2.0 * g * mu, 1e-4), 1.5)); }
+// light li's factors (cone x window x emitter cosine) at point p, and the phase toward it
+float lightShape(vec4 a, vec4 b, vec4 c, vec4 d, float type, vec3 p, vec3 dir, out float ph) {
+  vec3 L = a.xyz - p; float d2 = dot(L, L);
+  float x = d2 / (a.w * a.w); if (x >= 1.0) { ph = 0.0; return 0.0; }
+  float win = 1.0 - x * x; win *= win;
+  vec3 Ld = L * inversesqrt(max(d2, 1e-6));
+  ph = phaseHG2(dot(Ld, dir), uG) * 0.7 + 0.3 * 0.0796;
+  if (type > 1.5) return win * max(dot(-Ld, c.xyz), 0.0);          // rect: emitter cosine (area folded into the colour)
+  if (type > 0.5) return win * smoothstep(c.w, d.w, dot(-Ld, c.xyz)); // spot cone
+  return win;
+}
+void main() {
+  float dd = texture(uDepth, vUv).r;
+  vec3 vd = viewDirFromUv(vUv);
+  vec3 dir = normalize((uCamWorld * vec4(vd, 0.0)).xyz);
+  float dist = isSky(dd) ? 1e5 : length(viewPosFromDepth(vUv, dd));
+  float tEnd = min(dist, uMaxT);
+  vec3 acc = vec3(0.0);
+  for (int sI = 0; sI < NSEG; sI++) {
+    float s0 = float(sI) / float(NSEG), s1 = float(sI + 1) / float(NSEG);
+    float t0 = tEnd * s0 * s0, t1 = tEnd * s1 * s1;
+    vec3 pm = uCamPos + dir * (0.5 * (t0 + t1));
+    float sig = uDensity * exp(-max(pm.y, 0.0) * uHeightFall);
+    int bx, by; uvec4 h0; int n = cityLCell(pm, bx, by, h0);
+    for (int j = 0; j < VSLOTS; j++) {
+      if (j >= n) break;
+      int li = cityLIndex(j, bx, by, h0);
+      vec4 a = cityLTex(li, 0);
+      vec3 lo = a.xyz - uCamPos;
+      float tc = dot(lo, dir);
+      // skip lights whose range sphere misses this segment
+      float tcl = clamp(tc, t0, t1); vec3 pc = uCamPos + dir * tcl;
+      if (dot(a.xyz - pc, a.xyz - pc) > a.w * a.w) continue;
+      vec4 b = cityLTex(li, 1);
+      float vol = fract(b.w);
+      if (vol <= 0.02) continue;
+      vec4 c = cityLTex(li, 2), d = cityLTex(li, 3);
+      float type = floor(b.w);
+      // (night r11) point / spot haze core capped at a lamp head (0.9 m): headlights carry a 3.5 m diffuse softness
+      // radius, which as the haze core made a 3-4 m glare ball in front of every car facing the camera (street view);
+      // pk keeps the peak brightness, the glow is just compact
+      float rc = min(d.x, 0.9), core = type > 1.5 ? c.w * d.w : rc * rc + 0.25; // rect: its half-size as the soft core
+      float pk = type > 1.5 ? 1.0 : sqrt(core / (d.x * d.x + 0.25));
+      float h2 = max(dot(lo, lo) - tc * tc, 0.0) + core, h = sqrt(h2);
+      float I = pk * (atan((t1 - tc) / h) - atan((t0 - tc) / h)) / h;
+      if (I <= 0.0) continue;
+      // shape at the closest point of the segment and at the segment middle (the cone of a spot is crossed smoothly)
+      float ph0, ph1;
+      float sh = 0.6 * lightShape(a, b, c, d, type, pc, dir, ph0) + 0.4 * lightShape(a, b, c, d, type, pm, dir, ph1);
+      float ph = 0.6 * ph0 + 0.4 * ph1;
+      vec3 col = b.rgb * (type > 1.5 ? 4.0 * c.w * d.w : 1.0);
+      acc += col * (vol * I * sh * ph * sig);
+    }
+  }
+  fragColor = vec4(acc * uStrength * cityL.misc.x * cityLEdge(uCamPos), isSky(dd) ? 1e5 : dist);
+}`,
+  });
+
   // ---------------------------------------------------------------- SSGI (lighting2 r1: half-res screen-space one-bounce GI)
   // For one full-res pixel of each 2x2 block (rotating per frame, TAA integrates the rest): reconstruct the position and
   // depth normal, trace a few cosine-distributed rays in view space against the depth buffer, and on a hit gather the
@@ -309,9 +395,11 @@ void main() {
       uSMat: { value: [new THREE.Matrix4(), new THREE.Matrix4(), new THREE.Matrix4(), new THREE.Matrix4()] },
       uSplits: { value: new THREE.Vector4(1e9, 1e9, 1e9, 1e9) },
       uRes: { value: new THREE.Vector2(W, H) }, uFrame: { value: 0 }, uHavePrev: { value: 0 }, uStrength: { value: 1 },
+      uAbs: { value: 0 }, uAbsK: { value: 1 }, // (night) additive emissive bounce
     },
     fragmentShader: /* glsl */`
 precision highp float; precision highp sampler2DShadow; in vec2 vUv; out vec4 fragColor;
+uniform float uAbs, uAbsK;
 uniform sampler2D uDepth, uPrevRad; uniform mat4 uProj, uCamWorld, uPrevViewProj; uniform vec2 uRes;
 uniform float uFrame, uEnvI, uHavePrev, uStrength; uniform vec3 uAmbBounce;
 uniform sampler2DShadow uSM0, uSM1, uSM2, uSM3; uniform mat4 uSMat[4]; uniform vec4 uSplits;
@@ -400,7 +488,11 @@ void main() {
   float Ed = dot(uSunColor * ndl * vis + Eamb, vec3(0.2126, 0.7152, 0.0722));
   vec3 ratio = Egi * uStrength / max(Ed, 1e-3);
   ratio = min(ratio, vec3(1.6));
-  fragColor = vec4(ratio, dist);
+  // (night) emissive bounce: lit windows, screens, signs, neon, headlights light the surfaces around them. At night the
+  // pixel's own irradiance is ~0, so the ratio form cannot add light; output the absolute irradiance instead (composite
+  // adds it with an albedo proxy)
+  vec3 gAbs = Egi * uAbsK; gAbs *= 0.9 / (0.9 + max(gAbs.r, max(gAbs.g, gAbs.b))); // (r10) soft cap: colour bleed kept, no amber wash
+  fragColor = vec4(mix(ratio, gAbs, uAbs), dist);
 }`,
   });
 
@@ -437,17 +529,29 @@ void main() {
       uFogStart: { value: 0 }, uPx: { value: new THREE.Vector2() },
       uSceneA: { value: sceneRT.texture }, uSSR: { value: ssrRT.texture }, uSSROn: { value: 0 },
       uShafts: { value: shaftRT.texture }, uShaftOn: { value: 0 }, uHalfPx: { value: new THREE.Vector2() },
+      uCVol: { value: cvolRT.texture }, uCVolOn: { value: 0 }, uQuarterPx: { value: new THREE.Vector2() }, // (night) city-light haze
       uCloudShadow: { value: 0.4 }, // (foundation agent) strength of the projected cloud shadows (0 = off)
-      uGI: { value: ssgiRT.texture }, uGIOn: { value: 0 }, // (lighting2 r1) SSGI bounce ratio (half res, a = distance)
+      uGI: { value: ssgiRT.texture }, uGIOn: { value: 0 }, uGIAbs: { value: 0 }, uGIAlb: { value: 0.09 }, // (lighting2 r1) SSGI bounce ratio (half res, a = distance)
       uMoonDir: { value: new THREE.Vector3(0, 1, 0) }, uMoonK: { value: 0 }, // (daynight) moon disc
+      uNightHaze: { value: new THREE.Vector3() }, uNightHazeHi: { value: new THREE.Vector3() }, uNightFog: { value: 0 }, // (night) light-polluted haze
+      uGlowCol: { value: new THREE.Vector3() }, uGlowH: { value: 22 }, uGlowK: { value: 0.004 }, uNightMid: { value: new THREE.Vector3(0.0035, 0.0088, 0.0215) }, /* (r9) +20 % saturation looking down (rooftop_haze B-R) */ uTsGlow: { value: new THREE.Vector3(0.0056, 0.0045, 0.004) }, uNightMidLevel: { value: new THREE.Vector3(0.0062, 0.0068, 0.0105) }, // (night r6) blue mid-distance in-scatter // (night) warm street-level glow layer
     },
     fragmentShader: /* glsl */`
 precision highp float;
 precision highp sampler3D;
 in vec2 vUv; out vec4 fragColor;
 uniform sampler2D uColor, uDepth, uSky, uSceneA, uSSR, uShafts;
-uniform sampler2D uGI; uniform float uGIOn; // (lighting2 r1) SSGI
+uniform sampler2D uCVol; uniform float uCVolOn; uniform vec2 uQuarterPx; // (night)
+uniform sampler2D uGI; uniform float uGIOn, uGIAbs, uGIAlb; // (lighting2 r1) SSGI
 uniform vec3 uMoonDir; uniform float uMoonK; // (daynight)
+uniform vec3 uNightHaze, uNightHazeHi; uniform float uNightFog; // (night)
+uniform vec3 uGlowCol; uniform float uGlowH, uGlowK; uniform vec3 uNightMid, uTsGlow, uNightMidLevel;
+// (night r14) path length through an exponential height layer: int_a^b exp(-(y0 + t dy) / H) dt (density 1 at y = 0)
+float hazeInt(float y0, float dy, float a, float b, float H) {
+  float e0 = exp(-(y0 + a * dy) / H);
+  if (abs(dy) < 1e-3) return (b - a) * e0;
+  return H / dy * (e0 - exp(-(y0 + b * dy) / H));
+}
 // (foundation agent) projected cloud shadows: the sky's cumulus coverage field sampled where the sun ray from a surface
 // point crosses the cloud layer (same noise / coverage as sky.js cloudDensity, lower cloud band)
 uniform sampler3D uNoise; uniform float uCloudCoverage, uCloudBottom, uCloudTop, uCloudShadow, uCloudScale; uniform vec3 uCloudOffset;
@@ -462,6 +566,9 @@ vec3 fogColor(vec3 dir, float sunVis) {
   float mu = dot(dir, uSunDir);
   c *= mix(vec3(1.0), vec3(1.1, 1.0, 0.86), smoothstep(0.2, 0.95, mu) * 0.6);
   c += uSunColor * phaseHG(mu, 0.7) * uFogSun * 0.05 * sunVis;
+  // (night) the night haze is lit by the city below (light pollution), not by the black sky: a purple-grey veil,
+  // brighter / warmer toward the horizon and the street glow, cooler and dimmer looking up (refs/night esb + haze)
+  if (uNightFog > 0.0) c = mix(c, mix(uNightHaze, uNightHazeHi, smoothstep(-0.05, 0.35, dir.y)), uNightFog);
   return c;
 }
 float cloudShadowAt(vec3 wp) {
@@ -487,12 +594,11 @@ float cloudShadowAt(vec3 wp) {
   return sh * uCloudShadow * smoothstep(0.06, 0.2, uSunDir.y);
 }
 // depth-aware upsample of a half-res buffer whose alpha holds linear distance
-vec3 upsampleShafts(vec2 uv, float dist) {
-  vec2 hp = uHalfPx; vec2 base = (floor(uv / hp - 0.5) + 0.5) * hp; vec2 f = (uv - base) / hp;
+vec3 upsampleHalf(sampler2D tex, vec2 uv, float dist, vec2 hp) { vec2 base = (floor(uv / hp - 0.5) + 0.5) * hp; vec2 f = (uv - base) / hp;
   vec3 acc = vec3(0.0); float ws = 0.0;
   for (int j = 0; j < 2; j++) for (int i = 0; i < 2; i++) {
     vec2 o = vec2(float(i), float(j));
-    vec4 s = texture(uShafts, base + o * hp);
+    vec4 s = texture(tex, base + o * hp);
     float bw = (i == 0 ? 1.0 - f.x : f.x) * (j == 0 ? 1.0 - f.y : f.y);
     float dw = 1.0 / (1e-3 + abs(s.a - dist) / max(dist, 1.0) * 20.0);
     float w = bw * dw + 1e-5;
@@ -500,6 +606,7 @@ vec3 upsampleShafts(vec2 uv, float dist) {
   }
   return acc / ws;
 }
+vec3 upsampleShafts(vec2 uv, float dist) { return upsampleHalf(uShafts, uv, dist, uHalfPx); }
 // (lighting2 r1) depth-aware 3x3 blur-upsample of the half-res SSGI ratio (a = distance)
 vec3 upsampleGI(vec2 uv, float dist) {
   vec3 acc = vec3(0.0); float ws = 0.0;
@@ -539,13 +646,15 @@ void main() {
       }
     }
     if (uShaftOn > 0.5) c += upsampleShafts(vUv, 1e5);
+    if (uCVolOn > 0.5) c += upsampleHalf(uCVol, vUv, 1e5, uQuarterPx);
     fragColor = vec4(c, 1.0);
     return;
   }
   vec3 col = texture(uColor, vUv).rgb;
   if (uGIOn > 0.5) {
     float gd = length(viewPosFromDepth(vUv, d));
-    col *= 1.0 + upsampleGI(vUv, gd);
+    vec3 gi = upsampleGI(vUv, gd);
+    col = mix(col * (1.0 + gi), col + gi * uGIAlb, uGIAbs); // (night) additive emissive bounce (albedo proxy)
   }
   if (uSSROn > 0.5) {
     float w = texture(uSceneA, vUv).a - 1.0;
@@ -557,7 +666,7 @@ void main() {
       // reflection floor: glossy glass never collapses to black when it reflects a shadowed street / SSR miss.
       // Stylised like the refs: at least ~60% of the (horizon-ish) sky radiance times the Fresnel weight.
       vec3 skyH = skyLUT(normalize(vec3(dir.x, 0.12, dir.z)));
-      col = max(col, w * skyH * 0.35);
+      col = max(col, w * mix(skyH * 0.35, (uNightHaze * 1.1 + uGlowCol * 0.7) * smoothstep(0.25, 0.6, w), uNightFog)); // only true mirrors (puddles, glass), not glossy paint stripes // (night) SSR misses on wet ground mirror the light-polluted street haze, not a black sky (critic r1: puddles = dark holes)
     }
   }
   vec3 pv = viewPosFromDepth(vUv, d);
@@ -587,8 +696,35 @@ void main() {
   // (round 4) converge later: the near / mid distance keeps the blue-grey tinted in-scatter (graded aerial perspective
   // instead of a milky-white wall), only the far hinterland / horizon skirt melts into the horizon sky
   fogC = mix(fogC, skyLUT(normalize(vec3(dir.x, 0.012, dir.z))), smoothstep(9000.0, 45000.0, dist));
+  if (uNightFog > 0.0) fogC = mix(fogC, uNightMid, uNightFog * smoothstep(120.0, 350.0, dist) * (1.0 - smoothstep(900.0, 2200.0, dist))); // (night r6) moonlit blue atmosphere in the 150-900 m band (rooftop_haze ref), purple light-pollution haze beyond
   col = col * T + fogC * (1.0 - T);
   if (uShaftOn > 0.5) col += upsampleShafts(vUv, dist);
+  if (uCVolOn > 0.5) col += upsampleHalf(uCVol, vUv, dist, uQuarterPx);
+  // (night) street-level glow: the low haze layer (y < uGlowH) in the street canyons scatters the lamp / shop / car
+  // light, so from above the avenues read as warm glowing lines and at street level distant blocks sit in a warm veil
+  if (uNightFog > 0.0) {
+    // (night r7) moonlit blue atmosphere: additive in-scatter in the 150 m - 2 km band (lifts the dark city between the
+    // avenues to a deep blue like the rooftop_haze ref; a tint of the thin fog alone could not lift the blacks)
+    float bandA = (1.0 - exp(-dist * 0.0011)) * smoothstep(120.0, 350.0, dist) * (1.0 - smoothstep(1800.0, 3500.0, dist));
+    col += mix(uNightMidLevel, uNightMid, smoothstep(0.25, 0.6, -dir.y)) * bandA * 0.45 * uNightFog; // (night r8) blue when looking down (rooftop_haze ref), grey-violet near level (esb ref)
+    // (night r7) Times Square: the air between the towers glows with the screens (ray segment inside the square's box)
+    {
+      // (night r14) no 90 m ceiling (a flat lid over the square seen while swinging): the glow thins out with height (H 70 m)
+      vec3 bmin = vec3(-80.0, 0.0, -245.0), bmax = vec3(82.0, 400.0, -78.0);
+      vec3 inv = 1.0 / (dir + vec3(1e-6));
+      vec3 t0 = (bmin - uCamPos) * inv, t1 = (bmax - uCamPos) * inv;
+      vec3 tn = min(t0, t1), tf = max(t0, t1);
+      float ta = max(max(tn.x, tn.y), max(tn.z, 0.0)), tb = min(min(tf.x, tf.y), min(tf.z, min(dist, 3000.0)));
+      if (tb > ta) col += uTsGlow * (1.0 - exp(-hazeInt(uCamPos.y, dir.y, ta, tb, 70.0) * 0.0084)) * uNightFog;
+    }
+    // (night r14) user: 'a clear separation of the street level lights and the darkness above, like a plane'. The warm
+    // street glow was a slab (full density below uGlowH = 22 m, none above): its top read as a flat lid across the
+    // facades. Now an exponential layer (density 1 at the street, 1/e at uGlowH * 1.5 = 33 m): same glow in the canyons,
+    // fading out gradually up the walls
+    float y0 = uCamPos.y, dl = min(dist, 700.0); // (night r4) only the street canyons near the view glow: grazing rays to far water / shores crossed km of the layer (critic: water glows brighter than the city)
+    float lin = hazeInt(max(y0, 0.0), dir.y, 0.0, dl, uGlowH * 1.5);
+    col += uGlowCol * (1.0 - exp(-lin * uGlowK)) * uNightFog * mix(0.6, 1.0, smoothstep(20.0, 120.0, y0)); // (night r7) street-level cameras: less amber canyon tint (critic: warm dusk, ref is blue night)
+  }
   fragColor = vec4(col, 1.0);
 }`,
   });
@@ -924,6 +1060,12 @@ void main() {
     sharpen: Q.sharpen,
     grain: 0.012,
     shafts: 1.0,     // volumetric sun shaft strength
+    nightSplitShadow: new THREE.Vector3(0.93, 1.0, 1.1), // (r6) 0.88/0.98/1.16 darkened the ground
+    nightSplitStreet: new THREE.Vector3(0.8, 0.96, 1.3), // (night r7) street-level cameras // (night r5) split-tone of the darks at night
+    nightLift: new THREE.Vector3(0.0074, 0.0068, 0.0078), // (r8 / r9) unlit asphalt floor ~20 sRGB (critic: 17) // (night) black floor at night (refs: darkest street areas ~sRGB 20-35, nothing crushed to 0)
+    cityVol: 1.0,    // (night) lit haze around the city lights (citylights.js)
+    giNight: 0.35, giNightAlbedo: 0.3, // (r10) 1.0: street level went amber / 2x too bright (critic r9); the bounce is on top of real lights // (night) additive screen-space emissive bounce: irradiance gain, albedo proxy
+    streak: 0.012,   // (night) anamorphic streaks on bright lamps / headlights (night only)
     flare: 1.0,      // lens flare / sun glare strength
     gi: 0.5,         // (lighting2 r3) 1.0 -> 0.7 (less fill: darker shade, user) (lighting2 r1) SSGI bounce strength
     toe: 0.34, // (lighting2 r3) 0.36 -> 0.34 (tried 0.3: shade crushed to 0.004 vs topdown ref 0.023)
@@ -933,6 +1075,7 @@ void main() {
     name: 'final',
     uniforms: {
       uColor: { value: null }, uBloom: { value: null }, uPx: { value: new THREE.Vector2() },
+      uStreakSrc: { value: null }, uStreakLo: { value: null }, uStreak: { value: 0 }, uStreakT: { value: 2.5 }, // (night) anamorphic lamp streaks
       uExposure: { value: 1 }, uBloomStr: { value: 0.04 }, uSat: { value: 1 }, uContrast: { value: 1 },
       uLift: { value: grade.lift }, uGamma: { value: grade.gamma }, uGain: { value: grade.gain }, uWB: { value: grade.whiteBalance },
       uVignette: { value: 0.3 }, uCA: { value: 0.001 }, uSharpen: { value: 0.3 }, uGrain: { value: 0 }, uFrame: { value: 0 },
@@ -941,17 +1084,18 @@ void main() {
       uSunCol: { value: new THREE.Vector3() }, uPivot: { value: 0.18 }, uSatKnee: { value: 0.72 },
       uDepthS: { value: depthTex }, uProjInvS: { value: new THREE.Matrix4() }, uRevS: { value: reversed ? 1 : 0 },
       uAE: { value: null }, uAEOn: { value: 0 }, uAEKey: { value: 0 }, uAEStr: { value: 0.6 }, uAERange: { value: 1.25 },
-      uSplitSh: { value: grade.splitShadow }, uSplitHi: { value: grade.splitHigh }, uSplitBal: { value: 0.3 },
+      uSplitSh: { value: grade.splitShadow }, uSplitHi: { value: grade.splitHigh }, uSplitBal: { value: 0.3 }, uWarmGuard: { value: 0 },
       uToe: { value: 0.45 }, uRain: { value: 0 },
     },
     fragmentShader: /* glsl */`
 precision highp float; in vec2 vUv; out vec4 fragColor;
 uniform sampler2D uColor, uBloom; uniform vec2 uPx;
+uniform sampler2D uStreakSrc, uStreakLo; uniform float uStreak, uStreakT; // (night)
 uniform float uExposure, uBloomStr, uSat, uContrast, uVignette, uCA, uSharpen, uGrain, uFrame, uAspect;
 uniform vec3 uLift, uGamma, uGain, uWB; uniform float uPivot, uSatKnee;
 uniform sampler2D uSunVis; uniform vec2 uSunUv; uniform float uFlare; uniform vec3 uSunCol;
 uniform sampler2D uAE; uniform float uAEOn, uAEKey, uAEStr, uAERange;
-uniform vec3 uSplitSh, uSplitHi; uniform float uSplitBal;
+uniform vec3 uSplitSh, uSplitHi; uniform float uSplitBal; uniform float uWarmGuard;
 uniform sampler2D uDepthS; uniform mat4 uProjInvS; uniform float uRevS;
 bool isSkyD(float d) { return uRevS > 0.5 ? d <= 0.0 : d >= 1.0; }
 vec3 viewPosFromDepthS(vec2 uv, float d) { float z = uRevS > 0.5 ? d : d * 2.0 - 1.0; vec4 p = uProjInvS * vec4(uv * 2.0 - 1.0, z, 1.0); return p.xyz / p.w; }
@@ -1021,6 +1165,20 @@ void main() {
   // bloom (energy-conserving mix)
   vec3 b = texture(uBloom, vUv).rgb;
   c += b * uBloomStr; // (lighting2 r1) additive thresholded bloom
+  // (night) anamorphic streak (street ref: thin cool horizontal streaks through lamp heads / headlights): the half-res
+  // radiance above a high threshold, smeared horizontally with an exponential falloff
+  if (uStreak > 0.0) {
+    vec3 st = vec3(0.0);
+    for (int k = 1; k <= 12; k++) {
+      float o = float(k * k) * 0.0012, w = exp(-float(k) * 0.28);
+      // (night r11) point sources only: minus 1.5x the 1/16-res local mean, so big bright screens (whose mean ~ their
+      // radiance) don't smear a long pink bar across the frame; lamp heads / headlights (a few px) keep their streak
+      vec2 ua = vUv + vec2(o, 0.0), ub = vUv - vec2(o, 0.0);
+      vec3 a = texture(uStreakSrc, ua).rgb - 1.5 * texture(uStreakLo, ua).rgb, bb = texture(uStreakSrc, ub).rgb - 1.5 * texture(uStreakLo, ub).rgb;
+      st += (max(a - uStreakT, 0.0) + max(bb - uStreakT, 0.0)) * w;
+    }
+    c += dot(st, vec3(0.3, 0.5, 0.2)) * vec3(0.45, 0.62, 1.0) * uStreak;
+  }
   c += lensFlare(vUv);
   float ev = 0.0;
   if (uAEOn > 0.5) ev = clamp(-(texture(uAE, vec2(0.5)).r - uAEKey) * uAEStr, -uAERange, uAERange);
@@ -1032,6 +1190,7 @@ void main() {
   { // (atmosphere r2) split toning: cool shade, warm sunlit highlights (keeps luma)
     float sl = luma(c);
     vec3 tt = mix(uSplitSh, uSplitHi, smoothstep(uSplitBal * 0.25, uSplitBal * 2.2, sl));
+    tt = mix(tt, uSplitHi, uWarmGuard * smoothstep(0.02, 0.2, (c.r - c.b) / max(sl, 1e-3))); // (night r9) warm lamp / sodium / shop light keeps its warmth: no cool shift on warm pixels (critic: lavender lamp pools)
     tt /= dot(tt, vec3(0.2126, 0.7152, 0.0722));
     c *= tt;
   }
@@ -1099,6 +1258,7 @@ void main() { vec4 t = texture(uSrc, vUv); vec3 c = uMode > 0.5 ? vec3(t.a - 1.0
   const viewProj = new THREE.Matrix4();
   const prevViewProj = new THREE.Matrix4();
   const prevCamPos = new THREE.Vector3();
+  const _liftN = new THREE.Vector3(), _splitN = new THREE.Vector3(); // (night)
   const camPos = new THREE.Vector3();
   const prevCamQuat = new THREE.Quaternion();
   const tmpQ = new THREE.Quaternion();
@@ -1115,7 +1275,7 @@ void main() { vec4 t = texture(uSrc, vUv); vec3 c = uMode > 0.5 ? vec3(t.a - 1.0
     aoRT.setSize(W, H); litRT.setSize(W, H); hist[0].setSize(W, H); hist[1].setSize(W, H);
     postA.setSize(W, H); postB.setSize(W, H);
     skyRT.setSize(W >> 1, H >> 1); dofHalfA.setSize(W >> 1, H >> 1); dofHalfB.setSize(W >> 1, H >> 1);
-    ssrRT.setSize(W >> 1, H >> 1); shaftRT.setSize(W >> 1, H >> 1); ssgiRT.setSize(W >> 1, H >> 1);
+    ssrRT.setSize(W >> 1, H >> 1); shaftRT.setSize(W >> 1, H >> 1); cvolRT.setSize(W >> 2, H >> 2); ssgiRT.setSize(W >> 1, H >> 1);
     gmirror?.setSize(W, H);
     maskRT.setSize(W, H); maskDepth.image.width = W; maskDepth.image.height = H;
     allocBloom();
@@ -1181,6 +1341,9 @@ void main() { vec4 t = texture(uSrc, vUv); vec3 c = uMode > 0.5 ? vec3(t.a - 1.0
     // --- (render r-refl) glass mirror of the player / cars / peds (sampled by the facade glass in the scene pass)
     if (gmirror) { prof.begin('glassMirror'); gmirror.render(cam); }
 
+    // --- (night) real-time shadow maps of the city lights nearest the player (citylights.js)
+    if (cityLightsShared.origin.w > 0) { prof.begin('cityShadows'); cityLights.renderShadows(renderer, scene); }
+
     // --- scene
     prof.begin('scene+shadows');
     renderer.setRenderTarget(sceneRT);
@@ -1238,6 +1401,7 @@ void main() { vec4 t = texture(uSrc, vUv); vec3 c = uMode > 0.5 ? vec3(t.a - 1.0
         ssr.material.needsUpdate = true; ssr.material.userData.envH = hgt;
       }
       u.envMap.value = envTex; u.uEnvI.value = scene.environmentIntensity ?? 1;
+      u.uFloor.value = THREE.MathUtils.lerp(0.5, 0.06, lighting.nightHaze?.k ?? 0); // (night r12)
       u.uPrev.value = hist[1 - histIdx].texture; u.uHavePrev.value = (Q.taa && !resetHistory) ? 1 : 0;
       u.uProj.value.copy(cam.projectionMatrix); u.uProjInv.value.copy(cam.projectionMatrixInverse);
       u.uCamWorld.value.copy(cam.matrixWorld); u.uPrevViewProj.value.copy(prevViewProj);
@@ -1273,7 +1437,8 @@ void main() { vec4 t = texture(uSrc, vUv); vec3 c = uMode > 0.5 ? vec3(t.a - 1.0
       u.uProj.value.copy(cam.projectionMatrix); u.uProjInv.value.copy(cam.projectionMatrixInverse);
       u.uCamWorld.value.copy(cam.matrixWorld); u.uPrevViewProj.value.copy(prevViewProj);
       u.uRes.value.set(W, H); u.uFrame.value = frame % 64;
-      u.uStrength.value = grade.gi * (A.bounce.w ?? 1);
+      const giN = lighting.nightHaze?.k ?? 0; // (night)
+      u.uStrength.value = grade.gi * (A.bounce.w ?? 1); u.uAbs.value = giN; u.uAbsK.value = grade.giNight;
       ssgi.render(renderer, ssgiRT);
     }
 
@@ -1298,6 +1463,20 @@ void main() { vec4 t = texture(uSrc, vUv); vec3 c = uMode > 0.5 ? vec3(t.a - 1.0
       if (u.uSM0.value) shafts.render(renderer, shaftRT);
     }
 
+    // --- (night) city-light haze
+    const doCVol = cityLightsShared.origin.w > 0 && grade.cityVol > 0 && cityLights.volume > 0 && Q.shafts !== false;
+    if (doCVol) {
+      prof.begin('cityVolume');
+      const u = cvol.uniforms;
+      u.uProjInv.value.copy(cam.projectionMatrixInverse);
+      u.uCamWorld.value.copy(cam.matrixWorld); u.uCamPos.value.copy(camPos);
+      u.uFrame.value = frame % 64;
+      u.uStrength.value = grade.cityVol * (lighting.cityVol?.strength ?? 1);
+      u.uDensity.value = lighting.cityVol?.density ?? 0.012;
+      u.uHeightFall.value = 1 / (lighting.cityVol?.height ?? 40);
+      cvol.render(renderer, cvolRT);
+    }
+
     // --- AO
     let colorTex = sceneRT.texture;
     if (ao) {
@@ -1316,11 +1495,13 @@ void main() { vec4 t = texture(uSrc, vUv); vec3 c = uMode > 0.5 ? vec3(t.a - 1.0
       u.uCamPos.value.copy(camPos);
       const f = lighting.fog;
       u.uMoonDir.value.copy(lighting.moon?.dir ?? u.uMoonDir.value); u.uMoonK.value = lighting.moon?.k ?? 0; // (daynight)
+      { const nh = lighting.nightHaze; u.uNightFog.value = nh ? nh.k : 0; if (nh) { u.uNightHaze.value.fromArray(nh.low); u.uNightHazeHi.value.fromArray(nh.high); u.uGlowCol.value.fromArray(nh.cfg.glowCol); u.uGlowH.value = nh.cfg.glowH; u.uGlowK.value = nh.cfg.glowK; } } // (night)
       u.uFogDensity.value = f.density; u.uFogFalloff.value = f.heightFalloff; u.uFogSun.value = f.sunScatter;
       u.uFogTint.value.copy(f.tint); u.uFogStart.value = f.startDistance;
       u.uSSROn.value = doSSR ? 1 : 0;
-      u.uGIOn.value = doGI ? 1 : 0;
+      u.uGIOn.value = doGI ? 1 : 0; u.uGIAbs.value = lighting.nightHaze?.k ?? 0; u.uGIAlb.value = grade.giNightAlbedo / Math.PI; // (night)
       u.uShaftOn.value = doShafts && shafts.uniforms.uSM0.value ? 1 : 0;
+      u.uCVolOn.value = doCVol ? 1 : 0; u.uQuarterPx.value.set(1 / cvolRT.width, 1 / cvolRT.height);
       u.uHalfPx.value.set(1 / shaftRT.width, 1 / shaftRT.height);
       composite.render(renderer, litRT);
     }
@@ -1447,6 +1628,7 @@ void main() { vec4 t = texture(uSrc, vUv); vec3 c = uMode > 0.5 ? vec3(t.a - 1.0
     {
       const u = final.uniforms;
       u.uColor.value = cur.texture; u.uBloom.value = up.texture;
+      u.uStreakSrc.value = bloomDown[0].texture; u.uStreakLo.value = bloomDown[Math.min(3, bloomDown.length - 1)].texture; u.uStreak.value = grade.streak * (lighting.nightHaze?.k ?? 0); // (night)
       u.uPx.value.set(1 / W, 1 / H);
       const td = lighting.tod || {};
       u.uRain.value = td.rain ?? 0; u.uExposure.value = grade.exposure * (td.exposure ?? 1); u.uBloomStr.value = grade.bloom * (td.bloom ?? 1); u.uSat.value = grade.saturation;
@@ -1458,11 +1640,12 @@ void main() { vec4 t = texture(uSrc, vUv); vec3 c = uMode > 0.5 ? vec3(t.a - 1.0
       u.uProjInvS.value.copy(cam.projectionMatrixInverse);
       u.uAE.value = aeRT[aeIdx].texture; u.uAEOn.value = grade.autoExposure ? 1 : 0;
       u.uAEKey.value = grade.aeKey; u.uAEStr.value = grade.aeStrength; u.uAERange.value = grade.aeRange;
-      u.uToe.value = grade.toe; u.uSplitSh.value = grade.splitShadow; u.uSplitHi.value = grade.splitHigh; u.uSplitBal.value = grade.splitBalance;
+      u.uLift.value = _liftN.copy(grade.lift).addScaledVector(grade.nightLift, lighting.nightHaze?.k ?? 0); // (night)
+      u.uToe.value = grade.toe; u.uSplitSh.value = _splitN.copy(grade.nightSplitStreet).lerp(grade.nightSplitShadow, THREE.MathUtils.smoothstep(camPos.y, 25, 120)).lerp(grade.splitShadow, 1 - (lighting.nightHaze?.k ?? 0)); /* (night r7) street-level cameras: cooler (luma-kept) darks, moonlit blue like the street ref; aerials milder */ /* (night r5) cooler darks: blue night atmosphere (rooftop_haze / street refs) */ u.uSplitHi.value = grade.splitHigh; u.uWarmGuard.value = lighting.nightHaze?.k ?? 0; u.uSplitBal.value = THREE.MathUtils.lerp(grade.splitBalance, 0.14, lighting.nightHaze?.k ?? 0); /* (night r8) lamp pools / warm lit surfaces fall on the (warm) highlight side of the split */
       final.render(renderer, null);
     }
     if (pipeline.debug) {
-      const D = pipeline.debug, T = { ssr: ssrRT, ssgi: ssgiRT, shafts: shaftRT, ao: aoRT, scene: sceneRT, lit: litRT, ssrw: sceneRT }[D.tex];
+      const D = pipeline.debug, T = { ssr: ssrRT, ssgi: ssgiRT, shafts: shaftRT, cvol: cvolRT, ao: aoRT, scene: sceneRT, lit: litRT, ssrw: sceneRT }[D.tex];
       if (T) { dbgPass.uniforms.uSrc.value = T.texture; dbgPass.uniforms.uScale.value = D.scale ?? 1; dbgPass.uniforms.uMode.value = D.tex === 'ssrw' ? 1 : 0; dbgPass.render(renderer, null); }
     }
     prof.begin('external'); // GPU work issued between frames (planar mirrors, world/player updates) until next render()

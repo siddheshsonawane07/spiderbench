@@ -27,6 +27,7 @@ import { G, LAND_POLY, onLand, mulberry32, hash2, BRIDGES, pointInPoly, streetsA
 import { createGrassMaterial } from './ground.js'; // (r2) the park lawn shader (lawn variant) for every coast / plaza / Battery lawn
 import { STYLE, LAYER } from './facade.js';
 import { nightK, nightOnly } from '../render/daynight.js'; // (r2) esplanade lamp pools at night
+import { cityLights } from '../render/citylights.js'; // (night) the esplanade lamps are real lights (props.js lamp pool items)
 import { approachRects } from './bridges.js';
 import { highwayRuns, HW } from './highway.js';
 import { FAR_LANDS, FAR_Y, farShoreHeight } from './farshore.js';
@@ -934,7 +935,7 @@ export function buildWaterfront({ scene, T, piers = [], pileFields = [], solids 
     }
     for (const [k, A] of pc) {
       const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute(A.P, 3)); g.setAttribute('uv', new THREE.Float32BufferAttribute(A.U, 2)); g.setIndex(A.I); g.computeBoundingSphere();
-      const m = new THREE.Mesh(g, pm); m.name = 'coastLampPools-' + k; m.renderOrder = 2; m.onBeforeRender = () => { pm.opacity = nightK.value; };
+      const m = new THREE.Mesh(g, pm); m.name = 'coastLampPools-' + k; m.renderOrder = 2; m.onBeforeRender = () => { pm.opacity = cityLights.enabled ? 0 : nightK.value; }; // (night) replaced by real lamp light
       group.add(nightOnly(m));
     }
   }

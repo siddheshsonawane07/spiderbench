@@ -15,6 +15,8 @@ import { registry, curbBlocked } from './registry.js';
 import { createContactAO, createHeadlightPools } from '../contactao.js'; // (daynight) + headlight pools // (street r7) contact AO decals under cars
 import { csmShared, SHADOW_PROXY_LAYER } from '../../render/csm.js'; // (perf r2) shadow proxies
 import { perf2Off } from '../tilebatch.js'; // (perf r2) A/B switch
+import { cityLights } from '../../render/citylights.js'; // (night) real headlight / tail-light lighting
+import { nightK } from '../../render/daynight.js'; // (night)
 
 const RA = 640;            // streaming radius (m)
 const PARK_R = 500;        // parked cars exist on links within this radius ((citylife r2) 420 -> 500: no pop-in seen from rooftops, inside the haze)
@@ -149,7 +151,55 @@ export function createTraffic({ scene, roads, phase, geos, mats, models = null }
     for (const k of ['hi', 'low']) { scene.add(tiers[t][k].mesh); all.push(tiers[t][k]); }
   }
   const cao = createContactAO(scene, 1600); // (street r7)
-  const hlp = createHeadlightPools(scene, 600); // (daynight, lighting2 r4) headlight pools on the road at night
+  const hlp = createHeadlightPools(scene, 600); // (daynight, lighting2 r4) headlight pools on the road at night (fallback: ?nocl)
+  // (night) car lights (citylights.js): every moving car (and a parked one on hazards / at the bus stop) within CL_R of
+  // the camera whose beam can reach the view is a candidate; the CL_MAX nearest get a real forward headlight spot
+  // (cool white, lights the road ahead, the car in front, pedestrians, with a little lit haze) and the nearer ones a
+  // weak red tail-light point at the rear (brighter while braking). Parked cars are dark (instance state -1: partmat.js
+  // keeps their head / tail lamps off). Gathered in render() (after placeCar), emitted from the provider below
+  // (cityLights.build runs after world.update). No allocation per frame; nothing by day.
+  const CL_MAX = 50, CL_R = 200, CL_TAIL = 45, CL_CAP = 2048; // (night r9) twin lamps: fewer cars / tails so the core 1024-light cap is not hit
+  const clCar = new Array(CL_CAP).fill(null), clD = new Float32Array(CL_CAP), clSort = new Float32Array(CL_CAP);
+  let clN = 0;
+  // (night r9) user: 'one single light coming out of their front, should be a mix of light from both headlights, same for
+  // taillights; more diffused, not a thin streak going and expanding forwards'. The CL_TWIN nearest cars get two spots at
+  // the real lamp positions (+-(half width - 0.25) m, 0.72 m up, just ahead of the bumper), each half the car's light, so
+  // the pools overlap into one broad mixed pool with two soft lobes near the car; farther cars (up to CL_MAX) one merged
+  // spot at the car's centre line (same total). Wide soft low beam: half-angle 0.5, penumbra 0.9, aimed 0.1 rad down ->
+  // a broad fan on the asphalt ~2-12 m ahead (~1.2 at 2-3 m, ~0.35 at 5 m for the pair); radius 3.5 flattens the 1/d^2
+  // near field; volume 0.18 (the old thin expanding streak was mostly the lit-haze beam); spec 0.35 (wet-road glints).
+  // Twin tail lights: two small red points at the rear corners (brighter while braking).
+  const CL_TWIN = 30, CL_TILT = 0.1;
+  const clH = { type: 'spot', pos: [0, 0, 0], dir: [1, 0, 0], color: 0xffd8b0, intensity: 45, range: 20, angle: 0.5, penumbra: 0.9, radius: 3.5, volume: 0.18, key: 0, spec: 0 }; // (night r12) spec 0.35 (and even 0.06): an oncoming car's beam mirrored on the wet asphalt / puddles as big glare pools under it (user: 'reflections below ... double bad'); the beams only light diffusely
+  const clT = { type: 'point', pos: [0, 0, 0], color: 0xff1c0c, intensity: 0.75, range: 4.5, radius: 0.2, volume: 0.04, shadow: false };
+  const clOff = typeof location !== 'undefined' && /[?&]nohl\b/.test(location.search); // (night) ?nohl: car lights off (A/B)
+  cityLights.addProvider((emitL) => {
+    const n = clN; if (!n || clOff) return;
+    let lim = Infinity, limT = Infinity;
+    if (n > CL_TWIN) { clSort.set(clD); for (let i = n; i < CL_CAP; i++) clSort[i] = 1e12; clSort.sort(); limT = clSort[CL_TWIN - 1]; if (n > CL_MAX) lim = clSort[CL_MAX - 1]; }
+    for (let i = 0; i < n; i++) {
+      if (clD[i] > lim) continue;
+      const c = clCar[i], cy = c.parked ? 0 : c.y, p = c.parked ? 0 : c.pitch + c.gp, cs = Math.cos(c.ry), sn = Math.sin(c.ry), sp = Math.sin(p);
+      const h = c.len / 2 + 0.1, ly = cy + 0.72, twin = clD[i] <= limT;
+      const cq = Math.cos(p - CL_TILT), sq = Math.sin(p - CL_TILT);
+      clH.dir[0] = cs * cq; clH.dir[1] = sq; clH.dir[2] = -sn * cq;
+      const I = c.x > -112 && c.x < 112 && c.z > -352 && c.z < 22 ? 14 : 38; // (night r10) 25 / 45: wide twin beams from many cars over-lit the TS road (critic r9: 90 vs ref 42) // per lamp; (night r5) Times Square: the screens light the district
+      const id2 = (c.parked ? 1e6 + Math.round(c.x * 3 + c.z * 7919) : c.id) * 2; // (night) stable identities for the shadow slots
+      const fx = c.x + cs * h, fy = ly + sp * h, fz = c.z - sn * h, w = twin ? Math.max(0.5, c.wid / 2 - 0.25) : 0;
+      // lateral axis (right of travel): (sin ry, cos ry)
+      for (let k = twin ? -1 : 0; k <= (twin ? 1 : 0); k += 2 - (twin ? 0 : 1)) {
+        clH.pos[0] = fx + sn * w * k; clH.pos[1] = fy; clH.pos[2] = fz + cs * w * k;
+        clH.intensity = twin ? I : 2 * I; clH.key = id2 + (k > 0 ? 1 : 0);
+        emitL(clH);
+      }
+      if (clD[i] < CL_TAIL * CL_TAIL) {
+        const t = c.len / 2 + 0.2, br = c.parked ? (c.haz && (time * 1.5 + c.x * 0.01) % 1 < 0.5) : c.brake > 0;
+        const bx = c.x - cs * t, by = cy + 0.85 - sp * t, bz = c.z + sn * t, tw = Math.max(0.5, c.wid / 2 - 0.2);
+        clT.intensity = br ? 2 : 0.75;
+        for (let k = -1; k <= 1; k += 2) { clT.pos[0] = bx + sn * tw * k; clT.pos[1] = by; clT.pos[2] = bz + cs * tw * k; clT.key = 4e7 + id2 + (k > 0 ? 1 : 0); emitL(clT); }
+      }
+    }
+  }, { moving: true }); // (perf r9) moving lights: updated in place between full light-grid rebuilds (keys identify them)
   // lane obstacles (steam stacks): the lane link is blocked from blockS on; cars avoid routing into it
   for (const L of links) {
     L.blockS = Infinity;
@@ -843,6 +893,7 @@ export function createTraffic({ scene, roads, phase, geos, mats, models = null }
     const farSkip = (renderN++ & 1) === 1;
     for (const k of all) if (!(farSkip && k.farTier)) k.begin();
     cao.begin(); hlp.begin(); // (street r7) (daynight)
+    const clOn = cityLights.enabled && nightK.value > 0.01; clN = 0; // (night) car lights
     const cp = camera.position;
     camera.updateMatrixWorld();
     pv.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse); frustum.setFromProjectionMatrix(pv); frustumOk = true;
@@ -852,17 +903,23 @@ export function createTraffic({ scene, roads, phase, geos, mats, models = null }
         const along = dx * clear.dir.x + dz * clear.dir.z, lat = Math.abs(dx * clear.dir.z - dz * clear.dir.x);
         if (along > -6 && along < clear.len && lat < clear.half + c.len * 0.3) return;
       }
+      const lit = moving || c.haz !== undefined; // (night) parked cars: lights off (hazard trucks / taxis / buses at the stop: on)
+      if (clOn && lit && d2 < CL_R * CL_R && clN < CL_CAP) { // (night) headlight candidate: the beam (sphere ahead of the car) reaches the view
+        const f = c.len * 0.5 + 15;
+        sph.center.set(c.x + Math.cos(c.ry) * f, 1.5 + (moving ? c.y : 0), c.z - Math.sin(c.ry) * f); sph.radius = 18;
+        if (d2 < 400 || frustum.intersectsSphere(sph)) { clCar[clN] = c; clD[clN++] = d2; }
+      }
       const tier = d2 < HI_D * HI_D ? 'hi' : d2 < LOW_D * LOW_D ? 'low' : 'far';
       if (farSkip && tier === 'far') { if (moving) c._vis = true; return; }
       if (moving) c._vis = false;
       if (d2 > 1600) { sph.center.set(c.x, 1.5 + (moving ? c.y : 0), c.z); sph.radius = c.len * 0.6 + 1; if (!frustum.intersectsSphere(sph)) return; }
       if (moving) c._vis = true; // (citylife junctions) the stuck breaker only retires cars nobody is looking at
       const cy = moving ? c.y : 0, cpitch = moving ? c.pitch + c.gp : 0; // (citylife bridges) deck height + grade
-      tiers[c.type][tier].push(c.x, cy, c.z, c.ry, c.color, moving ? c.brake : c.haz ? ((time * 1.5 + c.x * 0.01) % 1 < 0.5 ? 1 : 0) : 0, cpitch, c.adSeed ??= Math.random()); // (citylife r1) hazards ((vehicles r2) + per-car seed)
+      tiers[c.type][tier].push(c.x, cy, c.z, c.ry, c.color, moving ? c.brake : c.haz ? ((time * 1.5 + c.x * 0.01) % 1 < 0.5 ? 1 : 0) : lit ? 0 : -1, cpitch, c.adSeed ??= Math.random()); // (night) -1: parked, lamps off // (citylife r1) hazards ((vehicles r2) + per-car seed)
       if (tier !== 'far' && proxyOn) tiers[c.type].proxy?.push(c.x, cy, c.z, c.ry, c.color, 0, cpitch); // (perf r2) (vehicles r1: LOD1 cars too)
       if (cy > 0.5) return; // on a bridge deck: no street-level contact AO / headlight pool
       if (tier !== 'far') cao.push(c.x, c.z, c.ry, VTYPES[c.type].len, VTYPES[c.type].wid); // (street r7)
-      if (moving && d2 < 250 * 250) hlp.push(c.x, c.z, c.ry, VTYPES[c.type].len); // (daynight) headlight pool
+      if (moving && d2 < 250 * 250 && !clOn) hlp.push(c.x, c.z, c.ry, VTYPES[c.type].len); // (daynight) headlight pool ((night) replaced by real headlights when cityLights is on)
     };
     for (const c of cars) { placeCar(c); emit(c, true); }
     for (const L of links) {

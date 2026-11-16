@@ -6,7 +6,9 @@ const OLD_KEYS = ['spidey.save.v1']; // saves from before the project was rename
 
 export const DEFAULT_SETTINGS = {
   quality: 'high', renderScale: 1, mouseSensitivity: 1, invertY: false,
-  masterVolume: 0.8, musicVolume: 0.6, sfxVolume: 0.9, ambienceVolume: 0.75, uiVolume: 0.7, // (audio r1) musicVolume
+  // (user r-mixdefaults) the user's tuned mix (80 / 4 / 16 / 10 / 6 %) is baked into audio.js TRIM: it is now 100 / 70 / 70 / 70 / 70
+  masterVolume: 1, musicVolume: 0.7, sfxVolume: 0.7, ambienceVolume: 0.7, uiVolume: 0.7,
+  audioV: 3, // settings older than 3 used the old volume scale: the audio sliders are reset to these defaults once on load
   showPins: true, minimalHud: false, subtitles: true, fovOffset: 0, motionBlur: 1, dof: 1, hudScale: 1, subtitleSize: 1,
   timeOfDay: 'day', // (lighting2 r3) fixed preset: day | morning | sunrise | sunset | dusk | night | overcast
   puddles: true, // (user r-nopuddles) water / wet patches on the ground in dry weather (rain always wets the streets)
@@ -35,6 +37,10 @@ export function createSave() {
       if (raw) {
         const s = JSON.parse(raw);
         if (s && s.v === 1) state = { ...defaultState(), ...s, settings: { ...DEFAULT_SETTINGS, ...(s.settings || {}) }, crimes: { ...defaultState().crimes, ...(s.crimes || {}) } };
+        if (!(s.settings?.audioV >= 3)) { // old volume scale -> the new defaults (= the mix tuned on the old scale)
+          for (const k of ['masterVolume', 'musicVolume', 'sfxVolume', 'ambienceVolume', 'uiVolume', 'musicV']) delete state.settings[k];
+          Object.assign(state.settings, { masterVolume: 1, musicVolume: 0.7, sfxVolume: 0.7, ambienceVolume: 0.7, uiVolume: 0.7, audioV: 3 });
+        }
       }
     } catch (e) { console.warn('[save] could not read save, starting fresh', e); }
   }

@@ -9,6 +9,8 @@ import { G, mulberry32, parkWaterAt, PARK_WATER } from './layout.js';
 import { FacadeBuilder, STYLE, LAYER } from './facade.js';
 import { MB } from './geom.js';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
+import { nightK } from '../render/daynight.js'; // (night) lamp globes glow at night
+import { cityLights } from '../render/citylights.js'; // (night) park lamps are real lights
 import { PARK_MEADOWS, meadowDist } from './trees.js';   // (park r3) ball-field positions (runtime use only: no init-order cycle)
 
 const GRASS_Y = G.CURB_H + 0.02;
@@ -934,6 +936,7 @@ function buildParkEdge(scene, S) {
     glow.setColor([1, 0.9, 0.72]);
     glow.cyl(x, y + 3.76, z, 0.16, 0.24, 0.54, 10, true, true); // globe
     S?.cyl(x, z, y, y + 4.48, 0.2, 0.2, 'pole');
+    parkLampLight(x, y, z); // (night)
   };
   const runs = [];
   for (const sx of [P.x0 - e, P.x1 + e]) runs.push({ x: sx + (sx < 0 ? -1.35 : 1.35), a: P.z0 + 6, b: P.z1 - 6, alongX: false });
@@ -942,7 +945,7 @@ function buildParkEdge(scene, S) {
   const lg = L.build();
   if (lg) { const m = new THREE.Mesh(lg, new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.55, metalness: 0.5 })); m.castShadow = true; m.receiveShadow = true; m.name = 'park-lamps'; scene.add(m); }
   const gg = glow.build();
-  if (gg) { const m = new THREE.Mesh(gg, new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.2, emissive: 0xffe2b0, emissiveIntensity: 0.35, transparent: true, opacity: 0.9 })); m.name = 'park-lamp-globes'; scene.add(m); }
+  if (gg) { const m = new THREE.Mesh(gg, parkGlobeMaterial()); m.name = 'park-lamp-globes'; scene.add(nightGlow(m)); } // (night) brighter at night
   // hex-paver band: 4 quads, a world-space hexagon shader (mortar lines, per-paver tone, grime near the wall)
   const W = 1.95, yy = y + 0.004, Pq = [], I = [];
   const quad = (x0, z0, x1, z1) => { const v = Pq.length / 3; Pq.push(x0, yy, z0, x0, yy, z1, x1, yy, z1, x1, yy, z0); I.push(v, v + 1, v + 2, v, v + 2, v + 3); };
@@ -1217,8 +1220,20 @@ function buildReservoirRiprap(box) {
   }
 }
 
+// (night) a Central-Park lantern globe: a soft warm point light at the globe (citylights.js) + a globe material whose
+// glow rises from a dim day value to a bright bulb at night
+function parkLampLight(x, y, z) {
+  cityLights.add({ type: 'point', pos: [x, y + 4.03, z], color: 0xffd6a0, intensity: 20, range: 14, radius: 0.35, volume: 0.35 });
+}
+function parkGlobeMaterial() {
+  const m = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.2, emissive: 0xffe2b0, emissiveIntensity: 0.35, transparent: true, opacity: 0.9 });
+  return m;
+}
+const nightGlow = (mesh) => { mesh.onBeforeRender = () => { mesh.material.emissiveIntensity = 0.35 + 1.6 * nightK.value; }; return mesh; };
+
 // Central-Park cast-iron lamp post (dark green, base, fluted shaft, lantern globe): MB L (post) + MB glow (globe)
 function lampPost(L, glow, S, x, y, z) {
+  parkLampLight(x, y, z); // (night)
   L.setColor([0.03, 0.045, 0.035]);
   L.cyl(x, y, z, 0.2, 0.16, 0.55, 8, true, false);          // base
   L.cyl(x, y + 0.55, z, 0.085, 0.065, 3.1, 8, false, true);  // shaft
@@ -1319,7 +1334,7 @@ function buildPathFurniture(scene, S, parkPaths) {
   const lg = L.build();
   if (lg) { const m = new THREE.Mesh(lg, new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.6, metalness: 0.4 })); m.castShadow = true; m.receiveShadow = true; m.name = 'park-path-furniture'; scene.add(m); }
   const gg = glow.build();
-  if (gg) { const m = new THREE.Mesh(gg, new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.2, emissive: 0xffe2b0, emissiveIntensity: 0.35, transparent: true, opacity: 0.9 })); m.name = 'park-path-globes'; scene.add(m); }
+  if (gg) { const m = new THREE.Mesh(gg, parkGlobeMaterial()); m.name = 'park-path-globes'; scene.add(nightGlow(m)); } // (night) brighter at night
   if (DP.length) {
     const g = new THREE.BufferGeometry();
     g.setAttribute('position', new THREE.Float32BufferAttribute(DP, 3));

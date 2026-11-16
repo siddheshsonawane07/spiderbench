@@ -44,7 +44,7 @@ export function generateBuildings(blocks, seed = 1234, opts = {}) {
   const tile = (x, z) => {
     const k = tkey(x, z);
     let t = tiles.get(k);
-    if (!t) { t = { fac: new FacadeBuilder(), lod: new FacadeBuilder(), det: new MB(), key: k, cx: (Math.floor(x / TILE) + 0.5) * TILE, cz: (Math.floor(z / TILE) + 0.5) * TILE }; tiles.set(k, t); }
+    if (!t) { t = { fac: new FacadeBuilder(), lod: Object.assign(new FacadeBuilder(), { noLights: true }) /* (night) no window lights from the far-LOD copy */, det: new MB(), key: k, cx: (Math.floor(x / TILE) + 0.5) * TILE, cz: (Math.floor(z / TILE) + 0.5) * TILE }; tiles.set(k, t); }
     return t;
   };
 

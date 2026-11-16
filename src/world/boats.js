@@ -7,6 +7,7 @@ import * as THREE from 'three';
 import { G, onLand, shoreX, mulberry32 } from './layout.js';
 import { farShoreHeight } from './farshore.js';
 import { REFL_LAYER } from './water.js';
+import { nightK } from '../render/daynight.js';
 
 const isWater = (x, z) => !onLand(x, z) && farShoreHeight(x, z) === null;
 
@@ -182,6 +183,13 @@ export function buildBoats({ scene, docks = [], solids = null }) {
   // (round 11) wakes were oversized and glowing white (unlit basic material): dimmer foam value + lower opacity
   boats.forEach((b, i) => { b.wi = i; });
   const wakeMat = new THREE.MeshBasicMaterial({ map: wakeTexture(), transparent: true, depthWrite: false, opacity: 0.8, color: 0xc2c9ca, fog: true, side: THREE.DoubleSide }); // (round 12: opacity 0.5 -> 0.7)
+  // (night r11) unlit foam glowed as a white smear on the dark river at night (x4.5 night exposure): moonlit-foam level
+  wakeMat.onBeforeCompile = (sh) => {
+    sh.uniforms.uNightK = nightK;
+    sh.fragmentShader = sh.fragmentShader.replace('#include <common>', '#include <common>\nuniform float uNightK;')
+      .replace('#include <color_fragment>', '#include <color_fragment>\ndiffuseColor.rgb *= mix(1.0, 0.025, uNightK);');
+  };
+  wakeMat.customProgramCacheKey = () => 'boat-wake-night-v1';
   const wakes = new THREE.InstancedMesh(wakeGeo, wakeMat, boats.length);
   wakes.name = 'boatWakes'; wakes.frustumCulled = false; wakes.renderOrder = 2;
   wakes.instanceMatrix.setUsage(THREE.DynamicDrawUsage);

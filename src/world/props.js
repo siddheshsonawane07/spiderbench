@@ -7,7 +7,10 @@ import { registry } from './npc/registry.js';
 import { MB, M4, hexLin } from './geom.js';
 import { Pool } from './pool.js';
 import { nightK, nightOnly } from '../render/daynight.js'; // (daynight)
-import { adsTexture } from './adstex.js'; // (billboards r3)
+import { cityLights } from '../render/citylights.js'; // (night) real street-lamp lighting
+import { adsTexture, signsTexture } from './adstex.js'; // (billboards r3) (night r5) sign atlas for blade-sign faces
+import { screenK } from '../render/daynight.js'; // (night r5)
+import { screenLightSet } from './screenlights.js'; // (night r9) billboard / lightbox faces light the street
 import { createPartMaterial, PART } from './partmat.js';
 import { COAST } from './waterfront.js'; // (coast r1) waterfront lamps / benches / trees
 import { GC_KEEP_OUT, PARK_VIADUCT, GC_TREE_SPOTS, GC_FORECOURTS } from './grandcentral.js';
@@ -424,19 +427,8 @@ function bladeSign() {
   for (const z of [Z0 + 0.12, Z1 - 0.12]) b.box(-0.015, Y1, z - 0.015, 0.015, Y1 + 0.13, z + 0.015); // hangers
   b.setPart(PART.PAINT).setColor(0xffffff);
   b.box(-T, Y0, Z0, T, Y1, Z1);                                              // tinted sign box (frame)
-  b.setPart(PART.LAMP).setColor(0xd8cfb4);
-  for (const sx of [-1, 1]) {                                                // lit faces, inset 6 cm from the frame
-    const x = sx * (T + 0.004);
-    b.box(Math.min(x, sx * T), Y0 + 0.08, Z0 + 0.07, Math.max(x, sx * T), Y1 - 0.08, Z1 - 0.07, sx > 0 ? 0b000001 : 0b000010);
-  }
-  b.setPart(PART.BASE).setColor(0x2a2320);
-  const rows = [0.34, 0.26, 0.3, 0.22, 0.28, 0.24];                          // lettering: stacked word blocks
-  let y = Y1 - 0.22;
-  for (const w of rows) {
-    const h = 0.17; y -= h + 0.09; if (y < Y0 + 0.14) break;
-    const zc = (Z0 + Z1) / 2;
-    for (const sx of [-1, 1]) { const x = sx * (T + 0.008); b.box(Math.min(x, sx * (T + 0.004)), y, zc - w, Math.max(x, sx * (T + 0.004)), y + h, zc + w, sx > 0 ? 0b000001 : 0b000010); }
-  }
+  // (night r5) the lit faces are real signs now: bladeFaces() (ts_signs atlas, one instanced draw) replaces the r4
+  // cream boxes with stacked black bars (critic r5: 'placeholder menu-icon art')
   return b.build({ part: true });
 }
 
@@ -763,8 +755,33 @@ export async function buildProps({ scene, blocks, parkPaths, T, solids = null, b
     P.lampPool = new Pool(pg, pm, { name: 'lampPool', max: 1200, far: 320, castShadow: false, receiveShadow: false });
     P.lampPool.items = P.lamp.items;
     P.lampPool.mesh.renderOrder = 2;
-    P.lampPool.mesh.onBeforeRender = () => { pm.opacity = nightK.value; };
+    P.lampPool.mesh.onBeforeRender = () => { pm.opacity = cityLights.enabled ? 0 : nightK.value; }; // (night) replaced by real lamp light (citylights.js)
     scene.add(nightOnly(P.lampPool.mesh));
+    // (night) every street lamp is a real light (citylights.js): a warm down-facing spot from the cobra head (local
+    // 0, 8.8, 2.9) lighting the sidewalk / road / cars / people, with a lit-haze cone. Registered once the items exist
+    // (re-registered if the item list changes).
+    let lampN = -1, lampIds = [];
+    cityLights.addProvider(() => {
+      const items = P.lamp.items; if (items.length === lampN) return;
+      for (const id of lampIds) cityLights.remove(id);
+      lampIds = []; lampN = items.length;
+      for (const it of items) {
+        const s = it.s ?? 1, sn = Math.sin(it.ry || 0), cs = Math.cos(it.ry || 0);
+        // NYC mix: most heads are 4000 K LED retrofits (near-white), some old high-pressure sodium (amber)
+        // (night r2) lead / user 'realistic': whiter LEDs, modest pools (~130 at 8.75 m: the asphalt under a head reads
+        // clearly lit, not white), fewer sodium heads; radius 0.9 = the head's lens size: leaves / awnings right next to
+        // the head take a soft near field instead of a blown 1/d^2 hot spot. Sodium heads glow amber (aState 1: partmat).
+        // (night r3) critic: 'pools clip to white, ref lamps are warm-white': -40 % peak (~1.0 under the head), a soft
+        // penumbra (the pool fades out smoothly), ~3700 K warm white + 30 % high-pressure sodium (~2100 K)
+        const h = Math.abs(Math.sin(it.x * 12.9898 + it.z * 78.233) * 43758.5453) % 1, sodium = h < 0.3;
+        // (night r5) critic: 'Times Square roads stage-lit' -> the screens light that district; its lamps at half power
+        const tsK = it.x > -112 && it.x < 112 && it.z > -352 && it.z < 22 ? 0.5 : 1;
+        if (it.extra) it.extra.aState = sodium ? 1 : 0;
+        lampIds.push(cityLights.add({ type: 'spot', pos: [it.x + 2.9 * s * sn, (it.y || 0) + 8.75 * s, it.z + 2.9 * s * cs], dir: [0, -1, 0],
+          angle: 1.3, penumbra: 0.8, color: sodium ? 0xffa452 : 0xffdab4, intensity: (sodium ? 65 : 70) * tsK, // (night r6) r5 cut to 54 / 58 darkened every street / plaza 20-30 % (critic); -15 % from r4's 76 / 82
+          range: 17, radius: 0.9, /* (night r10) 26: with consistent cell lists (no per-cell cull) the 15-26 m tails of every lamp added up (street level 2x, critic r9) */ volume: 0.4 })); // (night r4) wider batwing-like spread (full to ~15 deg, fading to 75 deg): lights the road between heads
+      }
+    });
   }
   mk('mast', trafficMast(), { max: 500, far: 560 });
   mk('post', trafficPost(), { max: 300, far: 320 });
@@ -1276,7 +1293,7 @@ export async function buildProps({ scene, blocks, parkPaths, T, solids = null, b
         const yb = V.yTop * Math.max(0, (V.z1 - z) / (V.z1 - V.z0)) - 1.3;
         if (Math.min(x, ex) < V.x1 && Math.max(x, ex) > V.x0 && z > V.z0 - 0.5 && z < V.z1 && yb < 7.3) return; }
       const it = place(P.mast, x, z, ry, SIG);
-      signals.push({ it, axis });
+      signals.push({ it, axis, mast: true }); // (night) mast: the signal light sits under the arm heads
       sCyl(it, 0, 0, 0, 7.3, 0.17);
       // mast arm: 0.5 m stepped boxes following the arm's rising top (<= 2 cm error); bottoms below the refit cut (6.2 m)
       // so city's instanced-solid refit keeps them (its heightfield alone loses the thin far end of the arm)
@@ -1514,6 +1531,7 @@ export async function buildProps({ scene, blocks, parkPaths, T, solids = null, b
   }
   let adMesh = null;
   if (ads && adItems.length + streetAds.length) adMesh = billboardFaces(scene, [...adItems, ...streetAds], ads);
+  if (P.blade?.items.length) bladeFaces(scene, P.blade.items); // (night r5)
 
 
   // traffic light phase (shared with the traffic sim and the crowd's walk signals)
@@ -1551,6 +1569,63 @@ export async function buildProps({ scene, blocks, parkPaths, T, solids = null, b
       aoP.mesh.renderOrder = -1;
       P.propContactAO = aoP; scene.add(aoP.mesh);
     }
+  }
+  { // (night r4) blade-sign lightboxes glow onto the wall / sidewalk around them: a small warm point light inside the box
+    // (local 0, 4.3, 0.7) for the nearest BL_N signs within BL_R of the camera; no allocation per frame
+    const BL_R = 70, BL_N = 16;
+    const rec = { type: 'point', pos: [0, 0, 0], color: [1, 0.9, 0.77], intensity: 2.2, range: 6, radius: 0.5, volume: 0.1 };
+    const near = new Array(BL_N).fill(null), nearD = new Float32Array(BL_N), nearI = new Int32Array(BL_N), WARM = [1, 0.9, 0.77];
+    const _bc = new THREE.Color();
+    cityLights.addProvider((emit, camera) => {
+      const items = P.blade?.items; if (!items?.length || nightK.value < 0.01) return;
+      const cx = camera.position.x, cz = camera.position.z;
+      let n = 0, worst = 0;
+      for (let ii = 0; ii < items.length; ii++) {
+        const it = items[ii], dx = it.x - cx, dz = it.z - cz, d2 = dx * dx + dz * dz;
+        if (d2 > BL_R * BL_R || it.hidden) continue;
+        if (n < BL_N) { near[n] = it; nearI[n] = ii; nearD[n++] = d2; if (d2 > nearD[worst]) worst = n - 1; else if (n === 1) worst = 0; continue; }
+        if (d2 >= nearD[worst]) continue;
+        near[worst] = it; nearI[worst] = ii; nearD[worst] = d2;
+        for (let k = 0; k < BL_N; k++) if (nearD[k] > nearD[worst]) worst = k;
+      }
+      for (let k = 0; k < n; k++) {
+        const it = near[k], sn = Math.sin(it.ry || 0), cs = Math.cos(it.ry || 0);
+        rec.pos[0] = it.x + 0.7 * sn; rec.pos[1] = (it.y || 0) + 4.3; rec.pos[2] = it.z + 0.7 * cs;
+        const bc = bladeSignCol[nearI[k]] ?? WARM; // (night r5) the board's colour (linear), lifted toward white a little
+        rec.color = _bc.setRGB(0.35 + 0.65 * bc[0], 0.35 + 0.65 * bc[1], 0.35 + 0.65 * bc[2], THREE.LinearSRGBColorSpace);
+        emit(rec);
+      }
+    });
+  }
+  { // (night) traffic signals cast their lens colour (citylights.js): one small spot per signal near the camera, from
+    // the lit lenses (mast: between the two arm heads over the road; post: the pole head) aimed along the lens axis and
+    // down, so the wet road under / ahead of it picks up a red / amber / green sheen (GGX highlight streaks on the wet
+    // asphalt) and nearby cars / people a faint tint. Only the nearest SIG_N within SIG_R; no allocation per frame.
+    const SIG_R = 80, SIG_N = 16, SIG_COL = [0xff2412, 0xffa01e, 0x2cffa8];
+    const rec = { type: 'spot', pos: [0, 0, 0], dir: [1, -0.5, 0], color: 0xffffff, intensity: 4, range: 12, angle: 0.9, penumbra: 0.8, radius: 0.7, volume: 0.1, shadow: false }; // radius: soft wet-road highlight, not a pin-point
+    const near = new Array(SIG_N).fill(null), nearD = new Float32Array(SIG_N);
+    cityLights.addProvider((emit, camera) => {
+      if (!signals.length || nightK.value < 0.01) return;
+      const cx = camera.position.x, cz = camera.position.z;
+      let n = 0, worst = 0;
+      for (const sg of signals) { // keep the SIG_N nearest (insertion into a small fixed list)
+        const it = sg.it, dx = it.x - cx, dz = it.z - cz, d2 = dx * dx + dz * dz;
+        if (d2 > SIG_R * SIG_R || it.hidden) continue;
+        if (n < SIG_N) { near[n] = sg; nearD[n++] = d2; if (d2 > nearD[worst]) worst = n - 1; else if (n === 1) worst = 0; continue; }
+        if (d2 >= nearD[worst]) continue;
+        near[worst] = sg; nearD[worst] = d2;
+        for (let k = 0; k < SIG_N; k++) if (nearD[k] > nearD[worst]) worst = k;
+      }
+      for (let k = 0; k < n; k++) {
+        const sg = near[k], it = sg.it, cs = Math.cos(it.ry || 0), sn = Math.sin(it.ry || 0);
+        const lx = 0.45, lz = sg.mast ? 5.9 : 0, ly = sg.mast ? 5.1 : 3.4;
+        rec.pos[0] = it.x + lx * cs + lz * sn; rec.pos[1] = (it.y || 0) + ly; rec.pos[2] = it.z - lx * sn + lz * cs;
+        rec.dir[0] = cs; rec.dir[1] = -0.55; rec.dir[2] = -sn;
+        rec.color = SIG_COL[Math.max(0, Math.min(2, Math.round(it.extra?.aState ?? 0)))];
+        rec.intensity = sg.mast ? 4.5 : 2.5; rec.range = sg.mast ? 13 : 9;
+        emit(rec);
+      }
+    });
   }
   const pools = Object.values(P);
   const itemsOf = (pool) => (pool ? pool.items.map(it => ({ x: it.x, y: it.y, z: it.z, ry: it.ry })) : []);
@@ -1708,6 +1783,76 @@ function placeRooftops({ buildings, P, S, rnd, place, sBox, sCyl, anchor, tintOf
   }
 }
 
+// (night r5) blade-sign faces: both sides of every projecting blade sign (props bladeSign(): box z 0.25..1.15, y 3.35..5.25,
+// half thickness 0.07) as one instanced quad draw. A ts_signs.webp cell per sign (shop names on coloured boards), the text
+// running up the face (NYC vertical blade signs), lit from inside: emissive with a darker rim, screenK-compensated so the
+// night face tops out ~170 sRGB (critic r5 cap). Faces beyond the blade pool's far distance (300 m) collapse in the vertex
+// shader (the frames are culled there). The blade point lights (cityLights provider above) take the board colour.
+export const bladeSignCol = []; // per blade item: linear board colour (filled when the atlas image arrives)
+function bladeFaces(scene, items) {
+  const T = 0.07, Y0 = 3.35, Y1 = 5.25, Z0 = 0.25, Z1 = 1.15, n = items.length * 2;
+  const geo = new THREE.PlaneGeometry(1, 1);
+  const cellA = new THREE.InstancedBufferAttribute(new Float32Array(n * 4), 4);
+  const mesh = new THREE.InstancedMesh(geo, null, n);
+  const m = new THREE.Matrix4(), l = new THREE.Matrix4(), q = new THREE.Quaternion(), Y = new THREE.Vector3(0, 1, 0), v = new THREE.Vector3(), sc = new THREE.Vector3(Z1 - Z0 - 0.14, Y1 - Y0 - 0.16, 1);
+  const cellOf = [];
+  items.forEach((it, i) => {
+    const h = Math.abs(Math.floor(it.x * 3.7) * 73856093 ^ Math.floor(it.z * 5.3) * 19349663) >>> 0, c = h % 64;
+    cellOf.push(c);
+    const u0 = (c % 4) / 4 + 2 / 2048, du = 0.25 - 4 / 2048, v0 = 1 - (Math.floor(c / 4) + 1) / 16 + 2 / 2048, dv = 1 / 16 - 4 / 2048;
+    for (const sx of [-1, 1]) {
+      const k = i * 2 + (sx > 0 ? 1 : 0);
+      cellA.setXYZW(k, u0 + du * 0.05, v0 + dv * 0.03, du * 0.9, dv * 0.94); // trim the board bevel / long-name ends
+      m.makeRotationY(it.ry || 0).setPosition(it.x, it.y || 0, it.z);
+      l.compose(v.set(sx * (T + 0.005), (Y0 + Y1) / 2, (Z0 + Z1) / 2), q.setFromAxisAngle(Y, sx * Math.PI / 2), sc);
+      mesh.setMatrixAt(k, m.multiply(l));
+    }
+  });
+  geo.setAttribute('aCell', cellA);
+  const mat = new THREE.MeshStandardMaterial({ map: signsTexture(), roughness: 0.3, metalness: 0 });
+  const uni = { uScreenK: screenK, uNightK: nightK };
+  mat.onBeforeCompile = (sh) => {
+    Object.assign(sh.uniforms, uni);
+    sh.vertexShader = sh.vertexShader.replace('#include <common>', '#include <common>\nattribute vec4 aCell; varying vec2 vFaceUv;')
+      .replace('#include <uv_vertex>', '#include <uv_vertex>\nvFaceUv = uv; vMapUv = aCell.xy + vec2(uv.y, 1.0 - uv.x) * aCell.zw; // text runs up the face')
+      .replace('#include <project_vertex>', `#include <project_vertex>
+        { vec3 ip = (modelMatrix * instanceMatrix * vec4(0.0, 0.0, 0.0, 1.0)).xyz; vec2 dd = ip.xz - cameraPosition.xz;
+          if (dot(dd, dd) > 90000.0) gl_Position = vec4(2.0, 2.0, 2.0, 1.0); } // beyond the blade frames' far cull (300 m)`);
+    sh.fragmentShader = sh.fragmentShader.replace('#include <common>', '#include <common>\nvarying vec2 vFaceUv; uniform float uScreenK; uniform float uNightK;')
+      .replace('#include <emissivemap_fragment>', `#include <emissivemap_fragment>
+        { // lit from inside: centre brightest, rim ~55 % (tubes behind the face); ~day level by day, x2.2 at night (screenK
+          // cancels the preset exposure): a white board tops out ~0.13 pre-exposure = ~170 sRGB at night
+          float ex = min(vFaceUv.x, 1.0 - vFaceUv.x) * 2.0, ey = min(vFaceUv.y, 1.0 - vFaceUv.y) * 2.0 * 2.3;
+          float lit = 0.55 + 0.45 * smoothstep(0.0, 0.8, min(ex, ey));
+          // (night r6) at night the board colour is lifted by a power curve on its peak channel (m^0.45): dark navy / green
+          // boards glow ~110-150 sRGB while white glyphs stay ~0.75 of clip (critic r6: 'unlit painted boards' at x2.2 linear)
+          vec3 bt = diffuseColor.rgb; float bm = max(max(bt.r, bt.g), bt.b) + 1e-4;
+          vec3 bNight = bt / bm * pow(bm, 0.45) * 2.0;
+          totalEmissiveRadiance += mix(bt * 0.5, bNight, uNightK) * lit * uScreenK; }`);
+  };
+  mat.customProgramCacheKey = () => 'blade-faces-n6';
+  mesh.material = mat; mesh.name = 'bladeFaces'; mesh.castShadow = false; mesh.receiveShadow = true;
+  mesh.computeBoundingSphere(); scene.add(mesh);
+  // board colours for the blade point lights: mean of each atlas cell (small canvas downsample, once)
+  if (typeof Image !== 'undefined') {
+    const im = new Image();
+    im.onload = () => {
+      const W = 64, H = 128, cv = document.createElement('canvas'); cv.width = W; cv.height = H;
+      const cx = cv.getContext('2d', { willReadFrequently: true }); cx.drawImage(im, 0, 0, W, H);
+      const d = cx.getImageData(0, 0, W, H).data, lin = (x) => { x /= 255; return x <= 0.04045 ? x / 12.92 : Math.pow((x + 0.055) / 1.055, 2.4); };
+      const avg = [];
+      for (let c = 0; c < 64; c++) {
+        let r = 0, g = 0, b = 0, k = 0;
+        for (let y = Math.floor(c / 4) * 8; y < Math.floor(c / 4) * 8 + 8; y++) for (let x = (c % 4) * 16; x < (c % 4) * 16 + 16; x++) { const o = (y * W + x) * 4; r += lin(d[o]); g += lin(d[o + 1]); b += lin(d[o + 2]); k++; }
+        const mx = Math.max(r, g, b, 1e-4); avg.push([r / mx, g / mx, b / mx]);
+      }
+      for (let i = 0; i < items.length; i++) bladeSignCol[i] = avg[cellOf[i]];
+    };
+    im.src = '/assets/city/tex/ts_signs.webp';
+  }
+  return mesh;
+}
+
 // ad faces: one instanced quad (10 x 4.1 m) per billboard, atlas cell per instance, gently lit
 function billboardFaces(scene, items, ads) {
   // (billboards r2) unit quad; per item size / local offset (bus-shelter panels, shed posters), default = rooftop 10 x 4.1
@@ -1736,18 +1881,31 @@ function billboardFaces(scene, items, ads) {
     sh.vertexShader = sh.vertexShader.replace('#include <common>', '#include <common>\nattribute vec4 aCell; attribute float aGain; varying float vGain;')
       .replace('#include <fog_vertex>', '#include <fog_vertex>\n vGain = aGain;')
       .replace('#include <uv_vertex>', '#include <uv_vertex>\n#ifdef USE_MAP\n vMapUv = aCell.xy + uv * aCell.zw;\n#endif\n#ifdef USE_EMISSIVEMAP\n vEmissiveMapUv = vMapUv;\n#endif');
-    sh.fragmentShader = sh.fragmentShader.replace('#include <common>', '#include <common>\nvarying float vGain;')
-      .replace('#include <emissivemap_fragment>', '#include <emissivemap_fragment>\n totalEmissiveRadiance *= vGain / 0.06;')
+    sh.uniforms.uNightK = nightK; // (night r9)
+    sh.fragmentShader = sh.fragmentShader.replace('#include <common>', '#include <common>\nvarying float vGain; uniform float uNightK;')
+      .replace('#include <emissivemap_fragment>', '#include <emissivemap_fragment>\n totalEmissiveRadiance *= mix(vGain, max(vGain, 0.25), uNightK) / 0.06; // (night r9) rooftop prints floodlit at night')
       .replace('#include <map_fragment>', '#include <map_fragment>\n diffuseColor.rgb = mix(diffuseColor.rgb, vec3(dot(diffuseColor.rgb, vec3(0.3, 0.55, 0.15))), 0.18) * 0.9 + 0.012;');
   };
-  mat.customProgramCacheKey = () => 'city-ads-v3';
+  mat.customProgramCacheKey = () => 'city-ads-v3n';
   const mesh = new THREE.InstancedMesh(geo, mat, items.length);
   const m = new THREE.Matrix4(), l = new THREE.Matrix4(), q = new THREE.Quaternion(), Y = new THREE.Vector3(0, 1, 0);
+  // (night r9) every lit face is a light: rooftop prints (floodlit: reflect their colours) and back-lit shelter / newsstand
+  // lightboxes, split by image region (screenlights.js); wheat-paste posters (gain < 0.05) are unlit
+  const SLP = screenLightSet(), cx = new THREE.Vector3(), cy = new THREE.Vector3(), cz = new THREE.Vector3(), cp = new THREE.Vector3();
   items.forEach((it, i) => {
     m.makeRotationY(it.ry).setPosition(it.x, it.y, it.z);
     l.compose(new THREE.Vector3(it.lx ?? 0, it.ly ?? 6.1, it.lz ?? 0.13), q.setFromAxisAngle(Y, it.fr ?? 0), new THREE.Vector3(it.w ?? 10, it.h ?? 4.1, 1));
     mesh.setMatrixAt(i, m.multiply(l));
+    const g = it.gain ?? 0.06;
+    if (g >= 0.05) {
+      m.extractBasis(cx, cy, cz); cp.setFromMatrixPosition(m);
+      const w = cx.length(), h = cy.length(); cx.normalize(); cz.normalize(); cp.addScaledVector(cz, 0.03);
+      const c = cell.array, k = i * 4, uv = [c[k], c[k + 1], c[k] + c[k + 2], c[k + 1] + c[k + 3]];
+      if (g < 0.2) SLP.rect(cp.toArray(), cz.toArray(), cx.toArray(), w, h, null, 1, { uv, printed: true });
+      else SLP.rect(cp.toArray(), cz.toArray(), cx.toArray(), w, h, null, 1, { uv, gain: 0.8 * g / 0.55, range: 9 });
+    }
   });
+  SLP.commit('propAds', { mergeA: 0 });
   mesh.castShadow = false; mesh.receiveShadow = true; mesh.name = 'billboard-ads';
   mesh.computeBoundingSphere();
   scene.add(mesh);

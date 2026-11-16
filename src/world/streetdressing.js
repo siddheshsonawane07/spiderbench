@@ -20,7 +20,7 @@ function patchAtlas() {
     for (let i = 11; i >= 0; i--) pts.push([ox + m + (S - 2 * m) * i / 12, oy + S - m + (rnd() - 0.5) * jag]);
     for (let i = 11; i >= 1; i--) pts.push([ox + m + (rnd() - 0.5) * jag, oy + m + (S - 2 * m) * i / 12]);
     g.beginPath(); pts.forEach(([x, y], i) => (i ? g.lineTo(x, y) : g.moveTo(x, y))); g.closePath();
-    const tone = [0.5, 0.62, 0.46, 0.6][k]; // (street r5) stronger patch contrast (critic: 'road too clean')
+    const tone = [0.36, 0.62, 0.34, 0.6][k]; // (street r5) stronger patch contrast (critic: 'road too clean') ((night r9) fresh-tar cells 0.5 / 0.46 -> 0.36 / 0.34: the tar seam outlines them, the fill no longer reads as a shadow)
     // (street r4) cells 1 / 3: older, sun-bleached patches (lighter than the road, like ref 16's patchwork); 0 / 2 fresh tar
     g.fillStyle = k === 1 ? 'rgba(132,132,130,0.36)' : k === 3 ? 'rgba(116,116,114,0.3)' : `rgba(22,24,27,${tone})`; g.fill();
     // speckle / wear inside
@@ -39,6 +39,7 @@ function patchAtlas() {
     g.restore();
     // tar seal along the cut
     g.lineWidth = 5; g.strokeStyle = 'rgba(8,8,9,0.55)'; g.stroke();
+    g.lineWidth = 2; g.strokeStyle = 'rgba(150,150,146,0.22)'; g.stroke(); // (night r9) a thin glossy sealant sheen on the seam: reads as a cut edge, not a shadow edge
   }
   const t = new THREE.CanvasTexture(cv);
   t.colorSpace = THREE.SRGBColorSpace; t.anisotropy = 8;
@@ -80,14 +81,14 @@ export function buildRoadPatches({ scene }) {
           continue;
         }
         if (kind < 0.5) {        // along a lane (street r7: 0.45 -> 0.5)
-          const lane = Math.floor(rnd() * 6), cx = a - 9 + lane * 3.6 + (rnd() - 0.5) * 0.8, w = 0.9 + rnd() * 1.6, L = 4 + rnd() * 16;
+          const lane = Math.floor(rnd() * 6), cx = a - 9 + lane * 3.6 + (rnd() - 0.5) * 0.8, w = 0.9 + rnd() * 1.6, L = 4 + rnd() * 9; // (night r9) critic: long dark lane strips read as shadows at night: 4-20 -> 4-13 m
           const z = zA + rnd() * Math.max(1, zB - zA - L);
           x0 = cx - w / 2; x1 = cx + w / 2; z0 = z; z1 = z + L;
         } else if (kind < 0.8) {  // square-ish cut (street r7: 0.5-0.62 only, smaller, more oblong)
           const cx = a + (rnd() - 0.5) * 18, w = 1.0 + rnd() * 1.8, h = 1.8 + rnd() * 4.2, z = zA + rnd() * (zB - zA - h);
           x0 = cx - w / 2; x1 = cx + w / 2; z0 = z; z1 = z + h;
         } else if (kind < 0.88) { // (street r5) milled + repaved section spanning 2-3 lanes (ref 16's big dark rectangles)
-          const nl = 2 + Math.floor(rnd() * 2), l0 = Math.floor(rnd() * (7 - nl)), L = 7 + rnd() * 16, z = zA + rnd() * Math.max(1, zB - zA - L);
+          const nl = 2 + Math.floor(rnd() * 2), l0 = Math.floor(rnd() * (7 - nl)), L = 7 + rnd() * 9, /* (night r9) 7-23 -> 7-16 m */ z = zA + rnd() * Math.max(1, zB - zA - L);
           x0 = a - G.AV_HALF + 0.5 + l0 * 3.5; x1 = x0 + nl * 3.5; z0 = z; z1 = z + L;
         } else {                  // transverse trench across part of the roadway
           const side = rnd() < 0.5 ? -1 : 1, w = 5 + rnd() * 5, h = 0.9 + rnd() * 0.8, z = zA + rnd() * (zB - zA - h);
@@ -96,7 +97,10 @@ export function buildRoadPatches({ scene }) {
         x0 = Math.max(x0, a - G.AV_HALF + 0.2); x1 = Math.min(x1, a + G.AV_HALF - 0.2);
         if (x1 - x0 < 0.5 || z1 <= z0) continue;
         if (x1 > V.x0 && x0 < V.x1 && z1 > V.z0 && z0 < V.z1) continue;
-        add(x0, z0, x1, z1, Math.floor(rnd() * 4), z1 - z0 > x1 - x0);
+        let cell = Math.floor(rnd() * 4);
+        // (night r9) long lane strips / milled sections: mostly older, lighter patches (cells 1 / 3) so their straight edges read as a repair, not a cast shadow
+        if ((kind < 0.5 || (kind >= 0.8 && kind < 0.88)) && !(cell & 1) && Math.abs(Math.sin(x0 * 12.9898 + z0 * 78.233) * 43758.5453) % 1 < 0.65) cell++;
+        add(x0, z0, x1, z1, cell, z1 - z0 > x1 - x0);
       }
     }
   }
@@ -270,7 +274,7 @@ export function buildStreetGrime({ scene, buildings = null }) {
       // oil-drip bands down the 4 travel lanes (+ a fainter one in the parking lanes)
       for (const s of [-1, 1]) for (let l = 0; l < 3; l++) {
         const x = a + s * (0.2 + G.AV_LANE * l + G.AV_LANE / 2) + (rnd() - 0.5) * 0.3;
-        chain(GC.DRIP, x, zA + 2, zB - 2, l === 2 ? 0.8 : 1.15, 18, [0, -1], l === 2 ? 0.55 : 0.12);
+        chain(GC.DRIP, x, zA + 2, zB - 2, l === 2 ? 0.7 : 0.8, 11, [0, -1], l === 2 ? 0.55 : 0.3); // (night r9) critic: a 2.3 m band running to the camera read as a long shadow: narrower (1.15 -> 0.8), shorter, broken
         // idling stains before both stop lines
         if (l < 2) for (const [z0, dir] of [[zA + 3, 1], [zB - 3, -1]]) if (rnd() < 0.75) {
           const z = z0 + dir * (1.5 + rnd() * 4);

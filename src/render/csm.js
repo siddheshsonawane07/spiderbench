@@ -105,6 +105,12 @@ function installChunks(N, taps, charCascade) {
 	#if defined( USE_SHADOWMAP ) && NUM_DIR_LIGHT_SHADOWS > 0
 	directLight.color *= ( directLight.visible && receiveShadow ) ? csmShadow() : 1.0;
 	#endif
+	#if defined( STANDARD ) || defined( LAMBERT )
+	{ // (night r6) moon on up-facing roofs / ground x shape.y^2 (1 by day): pale roofs read frosted from above (critic)
+		float csmUp = saturate( dot( geometryNormal, normalize( ( viewMatrix * vec4( 0.0, 1.0, 0.0, 0.0 ) ).xyz ) ) );
+		directLight.color *= mix( 1.0, ambData.shape.y * ambData.shape.y, csmUp );
+	}
+	#endif
 	{ // the sun is a disc, not a point: widen the specular lobe of very smooth surfaces for the key light only
 	#ifdef STANDARD
 	float csmR = material.roughness; material.roughness = max( csmR, 0.09 );

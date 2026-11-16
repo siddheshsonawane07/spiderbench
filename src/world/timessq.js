@@ -13,8 +13,10 @@ import { STYLE, LAYER } from './facade.js';
 import { MB } from './geom.js';
 import { AD_AVG_L, AD_AVG_P } from './ts_ads_meta.js';
 import * as ADM from './ts_ads_meta.js'; // (billboards r4) AD_ID_L / AD_ID_P: twin cells that show the same ad
-import { adsTexture } from './adstex.js'; // (billboards r3) one shared GPU copy of the ad atlas
+import { adsTexture, signsTexture } from './adstex.js'; // (billboards r3) one shared GPU copy of the ad atlas (night r5) + sign atlas
 import { nightK } from '../render/daynight.js'; // (daynight)
+import { cityLights } from '../render/citylights.js'; // (night) screens are real light sources
+import { screenLightSet, scrUniforms, SCR_GLSL_PARS, SCR_GAIN_GLSL, SCR_SHOULDER_GLSL, screenNightMat } from './screenlights.js'; // (night)
 
 const CH = G.CURB_H;
 const TS_SPILL = 1.3; // (r5) was 1.0 // (r4) strength of the screens' coloured light spill cards
@@ -219,6 +221,28 @@ function aoTexture() {
   return t;
 }
 
+// (night) storefront sign bands as light: their colour is the mean of their ts_signs.webp cell (4 x 16 cells), measured
+// once from a small canvas downsample when the image arrives (browser-cached: same URL as the texture)
+function signLights(q) {
+  if (!q.length || typeof Image === 'undefined') return;
+  const im = new Image();
+  im.onload = () => {
+    const W = 64, H = 128, cv = document.createElement('canvas'); cv.width = W; cv.height = H;
+    const cx = cv.getContext('2d', { willReadFrequently: true }); cx.drawImage(im, 0, 0, W, H);
+    const d = cx.getImageData(0, 0, W, H).data, lin = (v) => { v /= 255; return v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); };
+    const set = screenLightSet();
+    for (const s of q) {
+      const uc = (s.uv[0] + s.uv[2]) / 2, vc = (s.uv[1] + s.uv[3]) / 2, du = Math.abs(s.uv[2] - s.uv[0]) / 2, dv = Math.abs(s.uv[3] - s.uv[1]) / 2;
+      const x0 = Math.floor((uc - du) * W), x1 = Math.ceil((uc + du) * W), y0 = Math.floor((1 - vc - dv) * H), y1 = Math.ceil((1 - vc + dv) * H);
+      let r = 0, g = 0, b = 0, n = 0;
+      for (let y = Math.max(0, y0); y < Math.min(H, y1); y++) for (let x = Math.max(0, x0); x < Math.min(W, x1); x++) { const k = (y * W + x) * 4; r += lin(d[k]); g += lin(d[k + 1]); b += lin(d[k + 2]); n++; }
+      if (n) set.rect(s.c, s.n, s.u, s.w, s.h, [r / n, g / n, b / n], 3.0); // (night r3) x3.0 at gain 1.0 (r2 0.7 -> 1.8 at gain 1.9): street-level colour on the plaza (critic: plaza 0.6x ref)
+    }
+    set.commit('tsSigns', { mergeA: 1e9, mergeGap: 9, mergeMax: 44 }); // one emitter per run of sign bands along a face
+  };
+  im.src = TEX + 'ts_signs.webp';
+}
+
 // ------------------------------------------------------------------------------------------------ build
 export function buildTimesSquare({ scene, gen }) {
   const S = gen.solids, Z = gen.zips;
@@ -263,6 +287,7 @@ export function buildTimesSquare({ scene, gen }) {
   // in the gap), has >= 0.4 m deep side returns, and big low screens get a service catwalk with a railing underneath.
   // Every screen below ~30 m queues a coloured light-spill card for the ground / facade below it (see spill()).
   const spillQ = [], haloQ = [];
+  const SLS = screenLightSet(), signQ = []; // (night) screen / sign emitters -> cityLights (committed after the build)
   let noWalk = false;
   const scrRects = []; // (r7) face rects taken by screens / rigs (window AC units keep clear of them)
   const screen = (f0, ta, tb, ya, yb, dep, opt = {}) => {
@@ -297,6 +322,16 @@ export function buildTimesSquare({ scene, gen }) {
     // near-white wraps) are driven down, dark key-art cells up, so the canyon is no longer uniformly overexposed
     if (!opt.sign && !vinyl && uv.avg) { const a = uv.avg, lum = 0.2126 * a[0] + 0.7152 * a[1] + 0.0722 * a[2]; k *= Math.min(1.45, Math.max(0.55, Math.pow(0.15 / (lum + 0.02), 0.5))); } // (r9) dark cells lifted more (critic: 'many near-black')
     B.quad(P3(f, ta + e, ya + e, o), P3(f, tb - e, ya + e, o), P3(f, tb - e, yb - e, o), P3(f, ta + e, yb - e, o), n, uv, [k, k, k]);
+    // (night) the panel lights the square: emitter plane just behind the LED face (a player crawling on it is lit too).
+    // The facade the cabinet hangs on lies behind that plane (no direct light), so cabinets on outriggers add a point
+    // light in the stand-off gap (screenlights.js halo): the wall around the cabinet gets a soft glow falling off with
+    // distance (critic r2 / r3: zero spill on the facade beside a screen)
+    if (!vinyl && !opt.sign) {
+      SLS.rect(P3(f, (ta + tb) / 2, (ya + yb) / 2, o - 0.05), n, [f.r[0], 0, f.r[1]], w, h, uv.avg, 1, { uv }); // (night r9) per-region image colours
+      if (w * h > 30 && gap) SLS.halo(P3(f, (ta + tb) / 2, (ya + yb) / 2, -gap + Math.min(1.5, gap + o - 0.15)), n, [f.r[0], 0, f.r[1]], w, h, uv.avg);
+    }
+    else if (vinyl) SLS.rect(P3(f, (ta + tb) / 2, (ya + yb) / 2, o + 0.02), n, [f.r[0], 0, f.r[1]], w, h, uv.avg, 1, { uv, printed: true }); // (night r9) floodlit print reflects its colours
+    else if (opt.sign) signQ.push({ c: P3(f, (ta + tb) / 2, (ya + yb) / 2, o + 0.06), n, u: [f.r[0], 0, f.r[1]], w, h, uv }); // (night) sign-band light (colour from the sign atlas once loaded)
     if (opt.sign) return;
     if (vinyl) {
       // (r6) printed vinyl on a stretched frame: flat moulding, gooseneck lamps on arms along the top edge
@@ -428,6 +463,23 @@ export function buildTimesSquare({ scene, gen }) {
       }
       pts.length = 0; pts.push(...P2); len.length = 0; len.push(...L2);
     }
+    { // (night) the wrap as a few near-planar rect emitters (chunks of the polyline within ~35 deg)
+      let i0 = 0;
+      for (let i = 1; i < pts.length; i++) {
+        const a = pts[i0], b = pts[i], last = i === pts.length - 1;
+        const nx = pts[i][2], dev = a[2][0] * nx[0] + a[2][1] * nx[1];
+        if (!last && dev > 0.82) continue;
+        const dx = b[0] - a[0], dz = b[1] - a[1], L = Math.hypot(dx, dz);
+        if (L > 0.5) {
+          const u = [dx / L, 0, dz / L], nn = [u[2], 0, -u[0]], m2 = pts[Math.round((i0 + i) / 2)][2];
+          if (nn[0] * m2[0] + nn[2] * m2[1] < 0) { nn[0] *= -1; nn[2] *= -1; }
+          const cu = opt.tile ? null : [uv[0] + (uv[2] - uv[0]) * len[i0] / W, uv[1], uv[0] + (uv[2] - uv[0]) * len[i] / W, uv[3]]; // (night r9) this chunk's part of the image
+          SLS.rect([(a[0] + b[0]) / 2 - nn[0] * 0.05, (ya + yb) / 2, (a[1] + b[1]) / 2 - nn[2] * 0.05], nn, u, L, yb - ya - 2 * e, uv.avg, 1, cu ? { uv: cu } : {}); // just behind the face (see screen())
+          SLS.halo([(a[0] + b[0]) / 2 - nn[0] * o * 0.5, (ya + yb) / 2, (a[1] + b[1]) / 2 - nn[2] * o * 0.5], nn, u, L, yb - ya - 2 * e, uv.avg); // in the gap to the walls
+        }
+        i0 = i;
+      }
+    }
     for (let i = 1; i < pts.length; i++) {
       const p = pts[i - 1], q = pts[i], kt = Math.floor((len[i - 1] + len[i]) / 2 / T);
       const u0 = uv[0] + (uv[2] - uv[0]) * (len[i - 1] / T - kt), u1 = uv[0] + (uv[2] - uv[0]) * (len[i] / T - kt);
@@ -479,6 +531,7 @@ export function buildTimesSquare({ scene, gen }) {
     frm.setColor(0x2a2b2e);
     for (const t of [ta + 0.35, (ta + tb) / 2, tb - 0.35]) fbox(f, t - 0.04, t + 0.04, ya + 0.15, yb - 0.15, 0, D - 0.07, 'pole');
     neo.quad(P3(f, ta, ya, D + 0.025), P3(f, tb, ya, D + 0.025), P3(f, tb, yb, D + 0.025), P3(f, ta, yb, D + 0.025), n, uv, col);
+    SLS.point(P3(f, (ta + tb) / 2, (ya + yb) / 2, D + 0.6), new THREE.Color(col[0], col[1], col[2]), 6 + 2 * (tb - ta), 7 + (tb - ta), 0.35); // (night) neon glow on the wall / sidewalk
   };
   // tall frameless LED column (the full-height vertical fashion / brand boards of ref ts_day_perch), chrome edge
   const ledColumn = (f, ta, tb, ya, yb) => screen(f, ta, tb, ya, yb, 0.45, { bezel: 0.05, lip: 0.02, frame: FR_CHROME[Math.floor(rnd() * 3)], trim: 'none', noWalk: true, edgeLed: rnd() < 0.6 ? [0.85, 0.92, 1] : null });
@@ -607,6 +660,7 @@ export function buildTimesSquare({ scene, gen }) {
         }
         // soffit: a dense grid of downlight bulbs under the marquee
         const s0 = P3(f, t + 0.2, 4.695, 0.3), s1 = P3(f, t + w - 0.2, 4.695, D - 0.2);
+        SLS.point(P3(f, t + w / 2, 4.3, D * 0.6), new THREE.Color(1.0, 0.72, 0.42), 10 + 2.5 * w, 12, 0.4); // (night) marquee bulbs light the sidewalk
         lit.quad([s0[0], 4.695, s0[2]], [s1[0], 4.695, s0[2]], [s1[0], 4.695, s1[2]], [s0[0], 4.695, s1[2]], [0, -1, 0], [0, 0, Math.abs(s1[0] - s0[0]) / 0.45, Math.abs(s1[2] - s0[2]) / 0.45], [1, 0.9, 0.7]);
         t += w + 0.8 + rnd() * 2;
         continue;
@@ -639,6 +693,7 @@ export function buildTimesSquare({ scene, gen }) {
     for (const sg of [1, -1]) {
       const tt = t + sg * 0.225, N = [f.r[0] * sg, 0, f.r[1] * sg], oa = sg > 0 ? P - 0.1 : 0.25, ob = sg > 0 ? 0.25 : P - 0.1;
       scr.quad(P3(f, tt, y0 + 0.25, oa), P3(f, tt, y0 + 0.25, ob), P3(f, tt, y1 - 0.25, ob), P3(f, tt, y1 - 0.25, oa), N, uv, [1, 1, 1]);
+      SLS.rect(P3(f, tt + sg * 0.06, (y0 + y1) / 2, (P + 0.15) / 2), N, [f.n[0] * -sg, 0, f.n[1] * -sg], P - 0.35, y1 - y0 - 0.5, uv.avg); // (night)
     }
     lit.quad(P3(f, t - 0.2, y0, P + 0.01), P3(f, t + 0.2, y0, P + 0.01), P3(f, t + 0.2, y1, P + 0.01), P3(f, t - 0.2, y1, P + 0.01), [f.n[0], 0, f.n[1]], [0, 0, 1, (y1 - y0) / 0.3], [1, 0.82, 0.55]);
   };
@@ -773,6 +828,17 @@ export function buildTimesSquare({ scene, gen }) {
       for (const ta of [t0 + inset, t1 - inset - dw]) for (let y = tw.y0 + 1.4; y < tw.y1 - 1.5; y += fh) {
         lit.quad(P3(f, ta, y, 0.07), P3(f, ta + dw, y, 0.07), P3(f, ta + dw, y + dh, 0.07), P3(f, ta, y + dh, 0.07), n, [0.5, 0.5, 0.5, 0.5], col);
       }
+    }
+    // (night r9) ref ts_perch_night: the perch ledge / roof deck is flooded pink by a big LED screen right beside it. The
+    // west plaza tower of the south row (the perch cam -45.5, 55, -89 stands on its podium roof) gets a 20 x 15 m screen on
+    // the tower wall facing the podium deck, running a magenta ad. Own random stream (the ad layout elsewhere stays put)
+    if (tw && R.name === 'tsqTowerW' && R.lot.z1 > -100 && R.lot.z0 < -100 && tw.y1 > pod.y1 + 22) {
+      const keep = rnd; rnd = mulberry32(9109);
+      const { f, t0, t1 } = faceOf(tw, face), ta = t0 + 2.2, tb = Math.min(t1 - 2, ta + 20), ya = pod.y1 + (pod.parapet ?? 1.1) + 0.9, yb = ya + 15;
+      // the pink PUREWAVE ad (L42, the ref's magenta glow)
+      const uvP = namedUV('L42', (tb - ta - 0.6) / (yb - ya - 0.6)) ?? cellUV(true, 49, (tb - ta - 0.6) / (yb - ya - 0.6));
+      screen(f, ta, tb, ya, yb, 0.6, { uv: uvP, gap: 0.5, bezel: 0.3, lip: 0.16, frame: 0x1b1c1f, trim: 'bar', noWalk: true, noSpill: true, noHalo: true, bright: 0.38 }); // (night r10) 1.0 -> 0.38: whites ~0.8 of clip up close (the light spill uses the ad colours, unchanged)
+      rnd = keep;
     }
     for (const sd of [face, 'nz', 'pz']) if (sd === face || R.lot.sides[sd] === 'street') { // (r6) ground contact AO at the podium base
       const F = faceOf(pod, sd); aoStrip(P3(F.f, F.t0, yAO, 0), P3(F.f, F.t1, yAO, 0), [F.f.n[0], 0, F.f.n[1]], 1.2, 0.42); }
@@ -1720,14 +1786,19 @@ export function buildTimesSquare({ scene, gen }) {
   }
 
   // ---------------------------------------------------------------- meshes
-  const adsTex = adsTexture(), signTex = loadTex(TEX + 'ts_signs.webp'), paveTex = loadTex(TEX + 'ts_pavers.webp', { repeat: true, aniso: 16 });
+  const adsTex = adsTexture(), signTex = signsTexture() /* (night r5) shared copy */, paveTex = loadTex(TEX + 'ts_pavers.webp', { repeat: true, aniso: 16 });
   const dots = dotTexture();
   const add = (g, mat, name, shadow = false) => { if (!g) return null; const m = new THREE.Mesh(g, mat); m.name = name; m.castShadow = shadow; m.receiveShadow = true; scene.add(m); return m; };
   const screenMat = (map) => new THREE.MeshStandardMaterial({ map, color: 0x2a2a2a, emissive: 0xffffff, emissiveMap: map, emissiveIntensity: 2.5, roughness: 0.28, metalness: 0, vertexColors: true });
   const sm = screenMat(adsTex);
+  // (night) own night brightness (screenlights.js): out of the lighting.js emissive scan, x uScrBoost at night
+  sm.userData.nightGain = 1;
+  sm.defines = { ...sm.defines, CITYL_NOSPEC: '' }; // (night r11) no city-light specular on the LED faces (citylights.js)
   // LED panel micro-structure: faint pixel grid that fades out with distance (no moire far away)
   sm.onBeforeCompile = (sh) => {
-    sh.fragmentShader = sh.fragmentShader.replace('#include <emissivemap_fragment>', `#include <emissivemap_fragment>
+    Object.assign(sh.uniforms, scrUniforms());
+    sh.fragmentShader = sh.fragmentShader.replace('#include <common>', '#include <common>\n' + SCR_GLSL_PARS).replace('#include <emissivemap_fragment>', `#include <emissivemap_fragment>
+      totalEmissiveRadiance *= ${SCR_GAIN_GLSL}; // (night)
       { vec2 px = vEmissiveMapUv * vec2(4096.0) * 0.5; vec2 fw = fwidth(px);
         float k = clamp(1.0 - max(fw.x, fw.y) * 1.6, 0.0, 1.0);
         vec2 g = abs(fract(px) - 0.5); float m = smoothstep(0.5, 0.36, max(g.x, g.y));
@@ -1736,7 +1807,7 @@ export function buildTimesSquare({ scene, gen }) {
         float k2 = clamp(1.0 - max(fw.x, fw.y) * 4.0, 0.0, 1.0);
         totalEmissiveRadiance *= mix(vec3(1.0), (0.4 + 0.75 * m) * mix(vec3(1.0), 0.35 + 1.9 * tri, k2), k);
         // (r6) a touch less chroma (critic: 'over-saturated, too clean')
-        totalEmissiveRadiance = mix(totalEmissiveRadiance, vec3(dot(totalEmissiveRadiance, vec3(0.3, 0.55, 0.15))), 0.26); // (billboards r6) 0.14 -> 0.26 (critic r5: 'uniformly saturated poster imagery')
+        totalEmissiveRadiance = mix(totalEmissiveRadiance, vec3(dot(totalEmissiveRadiance, vec3(0.3, 0.55, 0.15))), mix(0.26, uScrDesat, uNightK)); // (night) vivid LED colour at night (ts_perch_night) // (billboards r6) 0.14 -> 0.26 (critic r5: 'uniformly saturated poster imagery')
         // (r7) LED cabinet modules (16 x 16 LEDs): thin dark seams that survive much farther than the LED grid, plus faint
         // horizontal scan rows (critic r6: 'flat glowing cards with no LED pixel grid or scanline')
         vec2 cb = vEmissiveMapUv * vec2(4096.0) / 32.0; vec2 fc = fwidth(cb);
@@ -1751,9 +1822,10 @@ export function buildTimesSquare({ scene, gen }) {
         totalEmissiveRadiance *= mix(vec3(0.5, 0.54, 0.6), vec3(1.0), smoothstep(0.08, 0.7, ca));
         // (r7) soft highlight shoulder: whites roll off instead of clipping to a flat near-white card
         float mx = max(totalEmissiveRadiance.r, max(totalEmissiveRadiance.g, totalEmissiveRadiance.b));
-        if (mx > 1.0) totalEmissiveRadiance *= (1.0 + (mx - 1.0) / (1.0 + (mx - 1.0) * 1.1)) / mx; }`);
+        if (mx > 1.0) totalEmissiveRadiance *= (1.0 + (mx - 1.0) / (1.0 + (mx - 1.0) * 1.1)) / mx;
+        ${SCR_SHOULDER_GLSL.replace('+ 1e-4;', '* clamp(vColor.r / 0.7, 0.3, 1.0) + 1e-4;')} }`); // (night r10) dim-driven panels (vertex k < 0.7) get a lower white cap
   };
-  add(scr.build(), sm, 'tsScreens');
+  const scrMesh = add(scr.build(), sm, 'tsScreens');
   { // (r6) printed vinyl posters: same atlas, lit by the sun / sky, slightly faded print
     const vm = new THREE.MeshStandardMaterial({ map: adsTex, vertexColors: true, roughness: 0.62, metalness: 0, color: 0xe2e2e2,
       emissive: 0xffffff, emissiveMap: adsTex, emissiveIntensity: 0 }); // (daynight) lit by gooseneck lamps at night (lighting.js scan: userData.nightLit)
@@ -1771,7 +1843,7 @@ export function buildTimesSquare({ scene, gen }) {
     const m = add(ao.build(), am, 'tsAO');
     if (m) { m.receiveShadow = false; m.renderOrder = 3; }
   }
-  add(sgn.build(), screenMat(signTex), 'tsSigns');
+  add(sgn.build(), screenNightMat(screenMat(signTex), 'tsSigns'), 'tsSigns'); // (night) screenNightMat: bright at night
   { // (billboards r6) neon tube lettering: the sign atlas letters only (contrast vs the blurred board), tube hue from the
     // vertex colour with a whiter hot core; the board is discarded so the wall / raceway shows between the letters
     const nm = new THREE.MeshStandardMaterial({ color: 0x000000, emissive: 0xffffff, emissiveMap: signTex, emissiveIntensity: 2.2, roughness: 0.4, metalness: 0, vertexColors: true, side: THREE.DoubleSide });
@@ -1780,13 +1852,13 @@ export function buildTimesSquare({ scene, gen }) {
       float m = smoothstep(0.1, 0.3, length(c - b));
       if (m < 0.4) discard;
       totalEmissiveRadiance = emissive * mix(vColor.rgb, vec3(1.0, 0.96, 0.92), 0.45 * smoothstep(0.65, 1.0, m)) * m; }`); };
-    nm.customProgramCacheKey = () => 'tsNeon';
+    nm.customProgramCacheKey = () => 'tsNeon'; screenNightMat(nm, 'neon'); // (night)
     add(neo.build(), nm, 'tsNeon');
   }
   add(lit.build(), new THREE.MeshBasicMaterial({ map: dots, vertexColors: true, color: 0xffffff, side: THREE.DoubleSide }), 'tsLights');
   { // scrolling news zippers
     const tt = loadTex(TEX + 'ts_ticker.webp', { aniso: 8 }); tt.wrapS = THREE.RepeatWrapping;
-    const tm = add(tck.build(), new THREE.MeshStandardMaterial({ map: tt, color: 0x202020, emissive: 0xffffff, emissiveMap: tt, emissiveIntensity: 2.4, roughness: 0.35 }), 'tsTicker');
+    const tm = add(tck.build(), screenNightMat(new THREE.MeshStandardMaterial({ map: tt, color: 0x202020, emissive: 0xffffff, emissiveMap: tt, emissiveIntensity: 2.4, roughness: 0.35 }), 'ticker'), 'tsTicker'); // (night)
     if (tm) tm.onBeforeRender = () => { tt.offset.x = (performance.now() * 0.00004) % 1; };
   }
   { // screen light spill (additive, no depth write)
@@ -1800,7 +1872,8 @@ export function buildTimesSquare({ scene, gen }) {
     if (m) { m.receiveShadow = false; m.renderOrder = 2; }
     // (daynight, lighting2 r4) additive spill is scaled by the x4.5 night exposure: it blew the road / plaza to white.
     // At night the spill drops to ~22 % (the per-pixel coloured spill in render/surface.js carries the screen light)
-    if (m) m.onBeforeRender = () => { sm2.color.setScalar(1 - 0.78 * nightK.value); };
+    // (night) with real screen lights (cityLights) the fake spill fades out completely as the lights fade in
+    if (m) m.onBeforeRender = () => { sm2.color.setScalar(1 - (cityLights.enabled ? 1 : 0.78) * nightK.value); };
     // (r9) halo falloff texture: (1 - |uv|)^2 radial from the (0, 0) corner = the screen edge
     const HS = 64, hd = new Uint8Array(HS * HS * 4);
     for (let y = 0; y < HS; y++) for (let x = 0; x < HS; x++) { const r = Math.min(1, Math.hypot(x / (HS - 1), y / (HS - 1))), v = Math.round(255 * Math.pow(1 - r, 2.2)), k = (y * HS + x) * 4; hd[k] = hd[k + 1] = hd[k + 2] = v; hd[k + 3] = 255; }
@@ -1816,7 +1889,10 @@ export function buildTimesSquare({ scene, gen }) {
     };
     hm.customProgramCacheKey = () => 'tsHaloFade';
     const mh = add(hal.build(), hm, 'tsHalo');
-    if (mh) { mh.receiveShadow = false; mh.renderOrder = 2; mh.onBeforeRender = () => { hm.color.setScalar(1 - 0.72 * nightK.value); }; } // (daynight) halo glow not blown at night
+    if (mh) { mh.receiveShadow = false; mh.renderOrder = 2; mh.onBeforeRender = () => { hm.color.setScalar(1 - (cityLights.enabled ? 1 : 0.72) * nightK.value); }; } // (daynight) halo glow not blown at night
+    // (night) full night + real screen lights: the spill / halo cards add nothing -> not drawn (toggled from the screens'
+    // own onBeforeRender, one frame lag; by day / at dusk they stay)
+    if (scrMesh && (m || mh)) scrMesh.onBeforeRender = () => { const on = !(cityLights.enabled && nightK.value > 0.99); if (m) m.visible = on; if (mh) mh.visible = on; };
   }
   { // wear decals (plaza + avenue roadway)
     const dt = loadTex(TEX + 'ts_decals.webp', { aniso: 8 });
@@ -1982,7 +2058,9 @@ export function buildTimesSquare({ scene, gen }) {
     // x4.5 night exposure blew the red glass glow to pink-white; at night it drops so the steps read deep red, row by row
     // (lighting2 r5) no per-frame override any more: it fought userData.nightGain (lighting.js night scan). One path: nightGain 0.4
     if (tm) tm.material.userData.nightGain = 0.4; }
-  return { planters: planters.length, bollards: bollards.length, screens: scr.v / 4, crowd: tsCrowdSpots.length };
+  const slStats = SLS.commit('ts'); // (night) screens / neon / marquees -> cityLights
+  signLights(signQ);
+  return { planters: planters.length, bollards: bollards.length, screens: scr.v / 4, crowd: tsCrowdSpots.length, lights: slStats };
 }
 
 // (r5) props.js asks this before placing sidewalk sheds / dumpsters: none inside the square (they read as placeholder

@@ -139,6 +139,7 @@ export function initSystems(ctx) {
 
   // ---------------------------------------------------------------- traversal-derived events (audio, tricks)
   const tr = { mode: '', sub: '', webActive: false, grounded: true, vy: 0, minVy: 0, trick: null, phase: 0, thwipT: 0, airT: 0, stepT: 0, stepSide: 1 };
+  const _footP = new THREE.Vector3();
   function traversalEvents(dt) {
     const P = ctx.player, a = P.anim; const v = P.velocity || a?.velocity; if (!v) return;
     const mode = a?.mode || P.mode || '';
@@ -185,7 +186,24 @@ export function initSystems(ctx) {
     const hs = Math.hypot(v.x, v.z), sp3 = v.length();
     const stepping = (mode === 'ground' && grounded && hs > 1.2 && /walk|run|sprint/.test(sub)) || (mode === 'wall' && /wallRun/.test(sub) && sp3 > 1.5);
     const roping = mode === 'rope' && (a?.rope?.speed ?? 0) > 0.4; // web tightrope: light ticks at the animator's rope cadence
-    if (stepping || roping) {
+    // (user r-foley2) "for running, sounds should match the rhythm of the legs, so when they touch ground": ground
+    // footsteps fire on each foot's real touchdown, read from the animated foot bones (height above the body's feet
+    // level: the moment a descending foot stops at its low point), so they follow whatever walk / run / sprint / stop
+    // blend is playing. Wall runs and the tightrope keep the cadence timer.
+    const fb = P.rig?.bones, footSync = mode === 'ground' && fb?.footL && fb?.footR;
+    if (footSync) {
+      const ft = tr.feet || (tr.feet = { L: { y: 0, v: 0, lo: 0, t: 1, ok: false }, R: { y: 0, v: 0, lo: 0, t: 1, ok: false } });
+      for (const S of ['L', 'R']) {
+        const f = ft[S]; fb['foot' + S].getWorldPosition(_footP);
+        const y = _footP.y - P.position.y, vy = dt > 1e-4 ? (y - f.y) / dt : 0;
+        if (!f.ok) { f.ok = true; f.y = f.lo = y; f.v = 0; continue; }
+        f.lo = Math.min(f.lo + dt * 0.15, y); f.t += dt; // low point of this foot's cycle (creeps back up on slopes / crouches)
+        const down = f.v < -0.35 && vy > -0.1 && y < f.lo + 0.07; // was falling, now stopped, near the ground
+        if (stepping && down && f.t > 0.16) { f.t = 0; audio.sfx.step(THREE.MathUtils.clamp(hs / 8, 0.5, 1.6), S === 'L' ? -0.12 : 0.12, 'ground'); }
+        f.y = y; f.v = f.v * 0.35 + vy * 0.65;
+      }
+    } else if (tr.feet) { tr.feet.L.ok = tr.feet.R.ok = false; }
+    if ((stepping && !footSync) || roping) {
       const spd = roping ? a.rope.speed : mode === 'wall' ? sp3 : hs;
       tr.stepT -= dt * (roping ? 2 * (0.7 + 0.45 * spd) : THREE.MathUtils.clamp(0.9 + spd * 0.16, 1.1, 3.4));
       if (tr.stepT <= 0) { tr.stepT += 1; tr.stepSide = -tr.stepSide; audio.sfx.step(roping ? 0.45 : THREE.MathUtils.clamp(spd / 8, 0.5, 1.6), tr.stepSide * 0.12, roping ? 'rope' : mode === 'wall' ? 'wall' : 'ground'); }
@@ -196,7 +214,13 @@ export function initSystems(ctx) {
       audio.sfx.land(sev); emit('player:land', { severity: sev });
     }
     if (grounded) tr.minVy = 0;
-    // (user r10h: the air whoosh at the bottom of each swing arc is removed)
+    // (user r10h removed the loud swing-arc whoosh; user r-foley2 asked for a much softer one back): a faint swish as he
+    // passes through the bottom of each swing arc (once per arc, fast swings only)
+    if (mode === 'swing' && webActive) {
+      const ph = Math.abs(a?.swing?.phase ?? 1);
+      if (ph < 0.3 && (tr.swishPh ?? 1) >= 0.3 && sp3 > 7) audio.sfx.swingSwish?.(sp3, a?.swing?.hand === 'L' ? -0.25 : 0.25);
+      tr.swishPh = ph;
+    } else tr.swishPh = 1;
     // air tricks -> XP (Air Tricks skill)
     const trick = a?.trick || null;
     if (trick && trick !== tr.trick && ctx.params.airTricks) prog.addXp(25, 'trick');

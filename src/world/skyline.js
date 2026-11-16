@@ -10,7 +10,8 @@
 //   one57    One57-like glass tower with a cascading stepped top
 //   wtc1     One-WTC-like: fin-clad cube base, tapering antiprism (x+z chamfer growing with height, stepped per tier),
 //            ring + 118 m spire
-import { STYLE, LAYER } from './facade.js';
+import { STYLE, LAYER, addCrownFlood } from './facade.js';
+import { cityLights } from '../render/citylights.js'; // (night) crown floodlights light nearby actors / props too
 import { lmBox, lmCyl } from './landmarks.js';
 
 const snapA = (A, y) => A.gH + Math.max(1, Math.round((y - A.gH) / A.floorH)) * A.floorH;
@@ -43,6 +44,27 @@ function chamferPlan(cx, cz, X, D, y0, y1, p) {
   return out;
 }
 
+// (night) Empire-State-like crown floodlighting (refs/night esb_perch_night: the setbacks from the 72nd floor up and the
+// mast washed warm gold from below). Shader floods (facade.js addCrownFlood: read from any distance) + a few real spot
+// lights on the terraces (citylights.js: light the player / props perched up there; the facade gets them too, kept soft).
+function esbFloods(lot, A, cx, cz, yObs, yb) {
+  const L = (n) => A.gH + n * A.floorH, gold = [1.0, 0.7, 0.36];
+  const t72 = ins(lot, 24.5, 24.5, 20, 20), t80 = ins(lot, 27.5, 27.5, 23, 23);
+  addCrownFlood(t72, L(72), L(80), gold, 2.4, 1.1); // (critic r4) 2-3 m band at the lip, dark stone above
+  addCrownFlood(t80, L(80), L(85) + 1, gold, 2.4, 1.1); // (critic r5) thin bright gold rim at each lip
+  addCrownFlood(sq(cx, cz, 12, 9), yObs, yObs + 14.6, gold, 2.0, 1.1);
+  addCrownFlood(sq(cx, cz, 12, 9), yObs + 1.5, yObs + 14.6, gold, 0.9, 6, 1.2, 1.75); // (night) lantern tiers: vertical up-light streaks on the piers, dark mullions
+  addCrownFlood(ins(lot, 21, 21, 17, 17), L(72) - 14, L(72) + 0.2, gold, 0.3, -3.5); // faint warm spill on the shaft below the lowest band
+  addCrownFlood(sq(cx, cz, 8.2), yb, yb + 38, [1.0, 0.8, 0.52], 0.4, 7, 1.2, 1.4); // mooring mast: lit from its base, the spire tip stays dim
+  floodSpots(t72, L(72) + 0.4, 0xffc27a, 4);
+  floodSpots(t80, L(80) + 0.4, 0xffc27a, 4);
+}
+// four up-lights per tier (one per face, ~3 m out on the terrace, aimed up the face)
+function floodSpots(b, y, color, intensity) {
+  const cx = (b.x0 + b.x1) / 2, cz = (b.z0 + b.z1) / 2;
+  for (const [px, pz, nx, nz] of [[cx, b.z0 - 2.8, 0, 1], [cx, b.z1 + 2.8, 0, -1], [b.x0 - 2.8, cz, 1, 0], [b.x1 + 2.8, cz, -1, 0]])
+    cityLights.add({ type: 'spot', pos: [px, y, pz], dir: [nx * 0.12, 1, nz * 0.12], angle: 0.7, penumbra: 0.7, color, intensity, range: 34, radius: 1.2, volume: 0 });
+}
 export function heroTowerReserves() {
   const R = [];
   // ------------------------------------------------------------------ Empire-State-like (5th Av & 34th St)
@@ -166,6 +188,7 @@ export function heroTowerReserves() {
       lmCyl(tile, S, Z, cx, cz, 3.6, yb + 44, yb + 49, METAL([2.0, 2.02, 2.05]), { n: 12, r1: 1.3, zipTop: false });
       lmCyl(tile, S, Z, cx, cz, 1.1, yb + 49, yb + 60, METAL([1.8, 1.8, 1.85]), { n: 8, r1: 0.8, zipTop: false });
       lmCyl(tile, S, Z, cx, cz, 0.7, yb + 60, yb + 106, METAL([1.6, 1.6, 1.65]), { n: 6, r1: 0.18 });
+      esbFloods(lot, bld.A, cx, cz, y0, yb); // (night)
     } });
   // ------------------------------------------------------------------ Chrysler-like (Lexington & 42nd)
   R.push({ name: 'chrysler', x0: 484, x1: 540, z0: -160, z1: -80, seed: 4202,
@@ -191,6 +214,9 @@ export function heroTowerReserves() {
         y += 6.2; h -= 1.5;
       }
       lmCyl(tile, S, Z, cx, cz, 2.2, y, y + 42, steel, { n: 8, r1: 0.1 });
+      // (night) the crown tiers + spire washed cool white from the setbacks (with the glowing sunburst windows)
+      addCrownFlood(sq(cx, cz, 12.5), bld.H, y + 42, [0.86, 0.92, 1.0], 0.55, 16);
+      floodSpots(sq(cx, cz, 12.5), bld.H + 0.4, 0xdce8ff, 10);
     } });
   // ------------------------------------------------------------------ Billionaires' Row (57th St) + Park Av
   // 432-Park-like: white concrete frame, 6 x 6 bays of 3 m square windows per face, open mechanical double floors
@@ -291,6 +317,7 @@ export function heroTowerReserves() {
       lmCyl(tile, S, Z, cx, cz, 9, y, y + 4.5, METAL([1.8, 1.85, 1.9]), { n: 16, style: STYLE.RIBBON, zipTop: false });
       lmCyl(tile, S, Z, cx, cz, 3.2, y + 4.5, y + 9, METAL([2.0, 2.0, 2.05]), { n: 12, zipTop: false });
       lmCyl(tile, S, Z, cx, cz, 2.1, y + 9, y + 140, METAL([2.7, 2.72, 2.75]), { n: 8, r1: 0.35 }); // (skyline r7) thicker, brighter spire: reads from Midtown
+      addCrownFlood(sq(cx, cz, 9.5), y, y + 140, [0.88, 0.93, 1.0], 0.7, 45); // (night) the ring + spire lit white
     } });
   // ------------------------------------------------------------------ (skyline r11) branded corporate HQ (west Midtown, 8th Av)
   // critic: 'missing a branded hero tower on the right (ref 06 / 07)'. Deep blue glass shaft with notched corners on a
@@ -332,6 +359,7 @@ export function heroTowerReserves() {
       lmCyl(tile, S, Z, mx, mz, 1.5, ym + 5, ym + 30, METAL([2.4, 2.4, 2.45]), { n: 8, r1: 0.9, zipTop: false });
       for (const f of [0.3, 0.65]) lmCyl(tile, S, Z, mx, mz, 2.2 - f, ym + 5 + 25 * f, ym + 5.6 + 25 * f, METAL([2.6, 2.6, 2.65]), { n: 8, zipTop: false });
       lmCyl(tile, S, Z, mx, mz, 0.9, ym + 30, ym + 46, METAL([2.7, 2.7, 2.75]), { n: 6, r1: 0.15 });
+      addCrownFlood({ x0: tm.x0 - 1, z0: tm.z0 - 1, x1: tm.x1 + 1, z1: tm.z1 + 1 }, y - 3, ym + 46, [0.85, 0.92, 1.0], 0.6, 14); // (night) louvred crown + mast lit white
       for (const [a, b] of [[-1, -1], [1, -1], [-1, 1], [1, 1]]) // four stay-braced struts at the mast foot
         lmBox(tile, S, Z, mx + a * 4.2 - 0.3, ym, mz + b * 4.2 - 0.3, mx + a * 4.2 + 0.3, ym + 9, mz + b * 4.2 + 0.3, METAL([2.2, 2.2, 2.25]), { zip: false });
     } });
@@ -367,6 +395,7 @@ export function heroTowerReserves() {
       lmBox(tile, S, Z, cx - 5, y2 + 1.2, cz - 6, cx + 5, y2 + 7, cz + 6, gp, { style: STYLE.CURTAIN });
       lmCyl(tile, S, Z, cx, cz, 1.8, y2 + 7, y2 + 12, METAL([2.4, 2.42, 2.45]), { n: 8, zipTop: false });
       lmCyl(tile, S, Z, cx, cz, 1.1, y2 + 12, y2 + 40, METAL([2.7, 2.72, 2.75]), { n: 8, r1: 0.2 });
+      addCrownFlood({ x0: cx - 9, z0: cz - 11, x1: cx + 9, z1: cz + 11 }, y, y2 + 40, [0.9, 0.94, 1.0], 0.5, 18); // (night) lantern + spire
     } });
   return R;
 }

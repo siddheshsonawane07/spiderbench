@@ -13,7 +13,7 @@
 import { nightK } from '../render/daynight.js'; // (daynight)
 import * as THREE from 'three';
 import { mulberry32, hash2, pointInPoly, onLand, shoreX, G } from './layout.js';
-import { FacadeBuilder, STYLE, LAYER } from './facade.js';
+import { FacadeBuilder, STYLE, LAYER, deriveFacadeMaterial } from './facade.js';
 import { bridgeSpans } from './bridges.js';
 import { REFL_LAYER } from './water.js';
 import { CanopyBatch } from './canopy.js';
@@ -136,6 +136,7 @@ const FAR = 4300;        // massed blocks out to this distance (beyond: only the
 const MAP = { x0: -6000, x1: 6000, z0: -7600, z1: 9000, px: 5 }; // ground-map coverage, metres per pixel
 
 export function buildFarShore({ scene, facadeMat, solids = null }) {
+  facadeMat = deriveFacadeMaterial(facadeMat, { NO_CITYLIGHT: '', FAR_NIGHT: '' }); // (night) no Manhattan street-light fill on the far-shore facades (flat tan band)
   const group = new THREE.Group(); group.name = 'farShore';
   scene.add(group);
   const rnd = mulberry32(9090);
@@ -154,7 +155,7 @@ export function buildFarShore({ scene, facadeMat, solids = null }) {
     if (p < 0.46 && r < 0.6) return RED_Q[Math.floor(r / 0.6 * RED_Q.length)];
     if (p > 0.74 && r < 0.6) return PALE_Q[Math.floor(r / 0.6 * PALE_Q.length)];
     return arr[Math.floor(r * 0.9999 * arr.length)]; };
-  const F = new FacadeBuilder();           // near buildings (facade shader)
+  const F = Object.assign(new FacadeBuilder(), { noLights: true }); // near buildings (facade shader); (night) out of window-light reach
   const FR = new FacadeBuilder();          // (round 4) rooftop kits + container stacks / cranes: small casters (near cascades only)
   const bulk = new FacadeBuilder();        // bulkheads, piers
   const M = { P: [], N: [], C: [], I: [], n: 0 }; // far massed blocks (vertex colours)
@@ -1210,7 +1211,7 @@ function createMassMaterial() {
             vec3 gl = mix(vec3(0.1, 0.13, 0.16), vec3(0.34, 0.4, 0.46), smoothstep(0.0, 180.0, vWPm.y) * 0.6 + 0.25 * mh(floor(vec2(along / 1.6, vWPm.y / 3.9))));
             vec3 c = mix(gl, base * 0.9, frame * 0.8);
             diffuseColor.rgb = mix(c, mix(vec3(0.14, 0.17, 0.2), vec3(0.28, 0.33, 0.37), smoothstep(0.0, 200.0, vWPm.y)), sub);
-            dnE = mix(vec3(0.8, 0.88, 1.0) * (1.0 - frame) * step(0.62, mh(floor(vec2(along / 1.6, vWPm.y / 3.9)) + 5.3)), vec3(0.02, 0.022, 0.026), sub); // (daynight, lighting2 r3) sub-pixel mean was 0.3 (x1.4 x night exposure ~3.6): the far shores glowed as a pale band
+            dnE = mix(vec3(0.8, 0.88, 1.0) * (1.0 - frame) * step(0.8, mh(floor(vec2(along / 1.6, vWPm.y / 3.9)) + 5.3)) * 0.5, vec3(0.009, 0.01, 0.012), sub); // (night) sparser, dimmer // (daynight, lighting2 r3) sub-pixel mean was 0.3 (x1.4 x night exposure ~3.6): the far shores glowed as a pale band
           } else {
             float fl = fract((vWPm.y - 1.2) / 3.3), u = fract(along / 2.4);
             float w = step(0.3, fl) * step(fl, 0.82) * step(0.28, u) * step(u, 0.74);
@@ -1219,12 +1220,13 @@ function createMassMaterial() {
             vec3 c = mix(base, wc, w);
             c = mix(c, mix(base, wc, 0.33), sub);
             diffuseColor.rgb = c;
-            dnE = mix(vec3(1.0, 0.72, 0.42) * w * step(0.55, mh(wid + 7.7)), vec3(0.026, 0.018, 0.01), sub); // (lighting2 r3) was 0.2/0.15/0.09 (pale band)
+            dnE = mix(vec3(1.0, 0.72, 0.42) * w * step(0.85, mh(wid + 7.7)) * (0.2 + 0.5 * mh(wid + 2.9)), vec3(0.012, 0.0085, 0.005), sub); // (night) sparse warm sparkle; the sub-pixel mean (was 0.026: x1.4 x4.5 exposure = the tan band) matches it
           }
           diffuseColor.rgb *= 0.62 + 0.38 * smoothstep(0.0, 14.0, vWPm.y - ${FAR_Y.toFixed(1)});   // contact darkening
-        }`)
+        }
+        diffuseColor.rgb *= 1.0 - 0.85 * uNightK; // (night) dark silhouettes at night (critic r1, r3)`)
       .replace('#include <emissivemap_fragment>', '#include <emissivemap_fragment>\ntotalEmissiveRadiance += dnE * uNightK * 1.4;');
   };
-  mat.customProgramCacheKey = () => 'far-mass-v2';
+  mat.customProgramCacheKey = () => 'far-mass-v3-night';
   return mat;
 }

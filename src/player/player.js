@@ -153,7 +153,7 @@ export async function createPlayer({ scene, world, camera, input, renderer }) {
       let r; try { r = override(I, dt, api); } catch (e) { console.error('[player] control override failed', e); r = I; }
       if (r === null) { NEUTRAL.look = I.look; I = NEUTRAL; } else if (r && r !== I) { combat = r.combat ? r : null; I = r; } else if (r && r.combat) combat = r;
     }
-    cam.applyLook(I);
+    cam.applyLook(I, dt);
     const q = trav.update(dt, I);
     lastQ.copy(q);
     if (combat && anim.mode === 'ground') {
@@ -167,6 +167,7 @@ export async function createPlayer({ scene, world, camera, input, renderer }) {
       else if (e.type === 'pointLaunch') { cam.impact(0.18); cam.kick?.(0.7); }
       else if (e.type === 'zipLaunch') cam.kick?.(Math.min(1, 0.45 + (e.dist || 0) / 60)); // slingshot: pull-back + FOV kick
       else if (e.type === 'zipYank') cam.shake(0.06);
+      else if (e.type === 'swingBoost') { cam.kick?.(0.3 + 0.35 * e.k); cam.shake(0.03 + 0.04 * e.k); } // (user r-anim7) full-swing release boost
       else if (e.type === 'quickBoost') { cam.kick?.(0.22 + 0.18 * e.k); cam.shake(0.04); } // small FOV kick (launch kick spring)
       else if (e.type === 'waterSplash') cam.shake(0.25);
       else if (e.type === 'wall' && e.run) cam.shake(0.08);

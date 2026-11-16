@@ -233,7 +233,7 @@ vec4 marchClouds(vec3 camM, vec3 rd, float jitter) {
       vec3 sunL = uSunColor * ms * powder * (0.25 / PI_) * uCloudSun;
       // (atmosphere r2) dark flat bases (little skylight reaches the underside, city below is dark), bright tops
       vec3 amb = mix(ambBot, ambTop, clamp(hf, 0.0, 1.0)) * mix(1.0, 0.25 + 0.75 * smoothstep(0.0, 0.6, hf), uCloudBaseDark)
-        + uSkyGlow * uNight * 0.35 * (1.0 - clamp(hf, 0.0, 1.0)); // (lighting2 r5) city glow lights the cloud undersides at night (orange underlit deck)
+        + uSkyGlow * uNight * 1.1 * (1.0 - clamp(hf, 0.0, 1.0)); // (night) r3: undersides lit by the city, brighter than the sky (critic: dark cloud blobs) // (lighting2 r5) city glow lights the cloud undersides at night (orange underlit deck)
       float sig = d * SIGMA;
       vec3 S = sunL + amb;
       float Ts = exp(-sig * dt);

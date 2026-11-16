@@ -18,6 +18,7 @@ import { PLAZA_CROWD_SPOTS } from '../props.js'; // (street r7) forecourt-plaza 
 import { PARK_CROWD_SPOTS } from '../park.js'; // (peds r6) lawn + park-edge people (were box figures in park.js)
 import { GC_CROWD_SPOTS } from '../grandcentral.js'; // (street r7) Park Av podium roof garden + colonnade people
 import { perf2Off } from '../tilebatch.js'; // (perf r2) A/B switch
+import { cityLights } from '../../render/citylights.js'; // (night) people cast city-light shadows
 
 const RP = 270;                 // sidewalk population radius around the camera
 const RNEAR = [120, 160]; /* (street r10) 95/135 -> 120/160 (director: 'many more pedestrians') */        // (street r8) 70/110 -> 95/135: denser sidewalks seen from swing height. near tier (extra walkers + crosswalk corner crowds): populate / release block distance
@@ -415,7 +416,12 @@ function makeMaterials(animTex, meta, pedTex, bakeTex) {
       .replace('#include <begin_vertex>', 'vec3 transformed = optHidden() ? vec3(0.0) : (skinMatrix() * vec4(bodyShape(position), 1.0)).xyz;');
   };
   depth.customProgramCacheKey = () => 'city-people-depth-v2';
-  return { mat, depth, uni };
+  // (night) city-light shadows (citylights.js addCaster): a distance material patched like the depth one (skinning +
+  // body shape animate), so people near a street lamp / headlight cast a real shadow on the sidewalk
+  const dist = new THREE.MeshDistanceMaterial();
+  dist.onBeforeCompile = depth.onBeforeCompile;
+  dist.customProgramCacheKey = () => 'city-people-dist-v1';
+  return { mat, depth, dist, uni };
 }
 
 // ------------------------------------------------------------------ instanced pool per (variant, LOD)
@@ -540,6 +546,8 @@ function createDogs(scene, bin, D) {
       .replace('#include <begin_vertex>', 'vec3 transformed = dogPose(position);');
   };
   depth.customProgramCacheKey = () => 'city-dog-depth-v1';
+  const dist = new THREE.MeshDistanceMaterial(); // (night) city-light shadows (LOD0)
+  dist.onBeforeCompile = depth.onBeforeCompile; dist.customProgramCacheKey = () => 'city-dog-dist-v1';
   const MAXD = [60, 200];
   const pools = D.lods.map((L, li) => {
     const g = new THREE.BufferGeometry();
@@ -556,6 +564,7 @@ function createDogs(scene, bin, D) {
     m.customDepthMaterial = depth; m.name = 'dogs-L' + li; m.count = 0; m.frustumCulled = false; m.castShadow = li === 0; m.receiveShadow = true;
     m.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
     scene.add(m);
+    if (li === 0) cityLights.addCaster(m, dist); // (night)
     return { m, iD, n: 0, max: MAXD[li] };
   });
   // leash: unit cylinder along +y, stretched between hand and collar
@@ -695,7 +704,7 @@ export async function createCrowd({ scene, blocks, parkPaths, props, roads, phas
   animTex.minFilter = animTex.magFilter = THREE.NearestFilter; animTex.needsUpdate = true;
   const ped = pedTex || new THREE.DataTexture(new Uint8Array([128, 128, 128, 255]), 1, 1);
   ped.flipY = false; ped.colorSpace = THREE.SRGBColorSpace; ped.anisotropy = 4; ped.needsUpdate = true;
-  const { mat, depth, uni } = makeMaterials(animTex, meta, ped, useBake ? bakeTex : null);
+  const { mat, depth, dist, uni } = makeMaterials(animTex, meta, ped, useBake ? bakeTex : null);
   const CL = {};
   for (const [k, c] of Object.entries(meta.clips)) CL[k] = c;
   const variants = meta.variants;
@@ -705,6 +714,7 @@ export async function createCrowd({ scene, blocks, parkPaths, props, roads, phas
     // LOD1 (24-70 m) into 1-2 only (cascade 0 covers < ~14 m, cascade 2 > ~50 m: only very long low-sun shadows differ)
     if (!perf2Off('nocrowdopt')) { if (li === 0) p.mesh.userData.maxCascade = 1; else if (li === 1) p.mesh.userData.minCascade = 1; }
     scene.add(p.mesh);
+    if (li === 0) cityLights.addCaster(p.mesh, dist); // (night) LOD0 (< 24 m) people cast city-light (lamp / headlight) shadows
     return p;
   }));
   const allPools = pools.flat();

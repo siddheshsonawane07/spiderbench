@@ -20,7 +20,8 @@ import { LAYER } from './facade.js';
 import { OVERHANG } from './collision.js';
 import { AD_AVG_L, AD_AVG_P } from './ts_ads_meta.js';
 import { nightK, screenK } from '../render/daynight.js'; // (daynight)
-import { adsTexture } from './adstex.js'; // (r3) shared GPU copy of the ad atlas
+import { adsTexture, signsTexture, signsGrid } from './adstex.js'; // (r3) shared GPU copy of the ad atlas (night r5) + sign atlas
+import { screenLightSet, uScrBoost, uScrKnee, uScrTop } from './screenlights.js'; // (night) LED screens / marquees as real lights
 
 const TEX = '/assets/city/tex/';
 const CELL = 512;
@@ -132,13 +133,13 @@ function signMaterial(ads, signs, noise, ghost, art) {
     transparent: ghost, depthWrite: !ghost, polygonOffset: ghost, polygonOffsetFactor: ghost ? -3 : 0, polygonOffsetUnits: ghost ? -3 : 0 });
   if (ghost) Object.assign(mat, { blending: THREE.CustomBlending, blendEquation: THREE.AddEquation, blendSrc: THREE.SrcAlphaFactor,
     blendDst: THREE.OneMinusSrcAlphaFactor, blendSrcAlpha: THREE.ZeroFactor, blendDstAlpha: THREE.OneFactor }); // keep the target alpha (SSR weight)
-  const uni = { tSigns: { value: signs }, tNoiseS: { value: noise }, tArt: { value: art }, uNightK: nightK, uScreenK: screenK }; // (daynight) uNightK
+  const uni = { tSigns: { value: signs }, tNoiseS: { value: noise }, tArt: { value: art }, uNightK: nightK, uScreenK: screenK, uScrBoost, uScrKnee, uScrTop }; // (daynight) uNightK (night) uScrBoost / shoulder
   mat.onBeforeCompile = (sh) => {
     Object.assign(sh.uniforms, uni);
     sh.vertexShader = sh.vertexShader.replace('#include <common>', '#include <common>\nattribute vec2 aSig; attribute vec2 aLoc; varying vec2 vSig; varying vec2 vLoc; varying vec3 vWPs;')
       .replace('#include <fog_vertex>', '#include <fog_vertex>\nvSig = aSig; vLoc = aLoc; vWPs = (modelMatrix * vec4(transformed, 1.0)).xyz;');
     sh.fragmentShader = sh.fragmentShader.replace('#include <common>', `#include <common>
-      uniform sampler2D tSigns; uniform sampler2D tArt; uniform sampler2D tNoiseS; varying vec2 vSig; varying vec2 vLoc; varying vec3 vWPs; float sgR; float sgM; vec3 sgE; uniform float uNightK; uniform float uScreenK;`)
+      uniform sampler2D tSigns; uniform sampler2D tArt; uniform sampler2D tNoiseS; varying vec2 vSig; varying vec2 vLoc; varying vec3 vWPs; float sgR; float sgM; vec3 sgE; uniform float uNightK; uniform float uScreenK; uniform float uScrBoost; uniform float uScrKnee; uniform float uScrTop;`)
       .replace('#include <map_fragment>', '')
       .replace('#include <color_fragment>', `#include <color_fragment>
       int K = int(vSig.x + 0.5);
@@ -223,11 +224,17 @@ function signMaterial(ads, signs, noise, ghost, art) {
       .replace('#include <emissivemap_fragment>', '#include <emissivemap_fragment>\n' +
         // (daynight) night: LED / back-lit faces dimmed against the x4.5 night exposure (readable + saturated, not blown to
         // white), marquee bulbs full, printed vinyl lit by its gooseneck lamps (brightest under the top rail)
-        'if (K == 3 || K == 4) sgE *= uScreenK * (K == 4 ? mix(1.0, 1.7, uNightK) : 1.0); /* (lighting2 r5) exposure-compensated at every preset */\n' +
+        'if (K == 3 || K == 4) sgE *= uScreenK * (K == 4 ? mix(1.0, 1.7, uNightK) : 1.0 + (uScrBoost - 1.0) * uNightK); /* (lighting2 r5) exposure-compensated at every preset (night) LED x uScrBoost at night */\n' +
+        // (night r2) same highlight shoulder as the Times Square screens (screenlights.js): LED / back-lit faces seen up close
+        // clipped to flat white blobs at the night exposure (vp:street corners); whole colour scaled, hue kept
+        // (night r2) chaser / marquee bulbs (K 6) were not exposure-compensated: x4.5 night exposure -> clipped white blobs at
+        // the blade-sign edges (vp:street): ~0.3 at night, still the hottest dots on the facade, a little bloom
+        'if (K == 6) sgE *= mix(1.0, 0.3, uNightK);\n' +
+        'if ((K == 3 || K == 4) && uNightK > 0.0) { float scrM = max(max(tx.r, tx.g), tx.b); if (scrM > uScrKnee) { float scrW = uScrTop - uScrKnee; float scrY = uScrKnee + scrW * (1.0 - exp(-(scrM - uScrKnee) / scrW)); sgE *= mix(1.0, scrY / scrM, uNightK); } }\n' +
         'if (uNightK > 0.0) { if (K == 1) sgE += diffuseColor.rgb * uNightK * 0.28 * (0.5 + 0.5 * smoothstep(0.2, 1.0, vLoc.y)); }\n' +
         'totalEmissiveRadiance += sgE;');
   };
-  mat.customProgramCacheKey = () => 'city-signage-r5-' + (ghost ? 'g' : 'o');
+  mat.customProgramCacheKey = () => 'city-signage-r5n2-' + (ghost ? 'g' : 'o'); // (night) r5n2
   return mat;
 }
 
@@ -239,6 +246,8 @@ export function buildSignage({ scene, gen }) {
   if (OFF) return { update() {}, stats };
   const S = gen.solids, Z = gen.zips;
   const rnd = mulberry32(90210);
+  const SLS = screenLightSet(); // (night) emitters -> cityLights (committed at the end)
+  const SLB = screenLightSet(); // (night r9) lit blade signs (sign atlas colours)
   // (r3) critic: placeholder-looking cells out of city billboards (flat colour + tiny product, generic 'YOUR CITY' copy, TS tickers)
   const pickL = makePicker(64, rnd), pickP = makePicker(64, rnd), pickS = makePicker(64, rnd), pickG = makePicker(8, rnd); // (r3) atlas regenerated: no bans
   const cells = new Map();
@@ -412,6 +421,7 @@ export function buildSignage({ scene, gen }) {
           const C = cellOf(cx, cz), stc = STEEL[Math.floor(r() * STEEL.length)];
           const uv = adLand(pickL(cx, cz), bw / bh);
           boxF(C.op, fr, u0, u1, yb, yt, nB, nF, stc, uv, 1, 0);                                        // panel (vinyl front, steel back)
+          SLS.rect(at(fr, (u0 + u1) / 2, (yb + yt) / 2, nF + 0.03), [fr.N[0], 0, fr.N[1]], [fr.T[0], 0, fr.T[1]], bw, bh, null, 1, { uv, printed: true }); // (night r9) floodlit print lights the roof
           boxF(C.op, fr, u0 - 0.12, u1 + 0.12, yt, yt + 0.14, nB - 0.04, nF + 0.06, stc.map(v => v * 0.7), null, 0, 0, 62); // top rail
           boxF(C.op, fr, u0 - 0.12, u1 + 0.12, yb - 0.16, yb, nB - 0.04, nF + 0.06, stc.map(v => v * 0.7), null, 0, 0, 62); // bottom rail
           for (const ue of [u0 - 0.12, u1]) boxF(C.op, fr, ue, ue + 0.12, yb - 0.16, yt + 0.14, nB - 0.04, nF + 0.06, stc.map(v => v * 0.75), null, 0, 0, 61); // side trims
@@ -491,6 +501,7 @@ export function buildSignage({ scene, gen }) {
             //      service catwalk on brackets with a handrail, gooseneck flood lamps aimed up at the print
             const stc = STEEL[Math.floor(r() * STEEL.length)], dk = stc.map(v => v * 0.72), fd = 0.32, fb = 0.2;
             boxF(C.op, fr, u0, u0 + w, y0, y1, 0.02, fd - 0.07, stc, uv, 1, 0, 1);                      // print, recessed 7 cm
+            SLS.rect(at(fr, u0 + w / 2, (y0 + y1) / 2, fd - 0.04), [fr.N[0], 0, fr.N[1]], [fr.T[0], 0, fr.T[1]], w, h, null, 1, { uv, printed: true }); // (night r9)
             boxF(C.op, fr, u0 - fb, u0 + w + fb, y1, y1 + fb, 0.0, fd, dk, null, 0, 0, 61);            // top rail
             boxF(C.op, fr, u0 - fb, u0 + w + fb, y0 - fb, y0, 0.0, fd, dk, null, 0, 0, 61);            // bottom rail
             boxF(C.op, fr, u0 - fb, u0, y0, y1, 0.0, fd, dk, null, 0, 0, 61);                          // stiles
@@ -546,6 +557,8 @@ export function buildSignage({ scene, gen }) {
           B.i.push(v, v + 1, v + 2, v, v + 2, v + 3); B.v += 4;
         };
         sideQuad(uc + 0.185, 1); sideQuad(uc - 0.185, -1);
+        { const su = [uv[0] - 2, uv[1], uv[2] - 2, uv[3]]; // (night r9) both lit faces as lights (the sign cell's own colour)
+          for (const sg of [1, -1]) SLB.rect(at(fr, uc + sg * 0.2, (y0 + y1) / 2, (n0 + n1) / 2), [fr.T[0] * sg, 0, fr.T[1] * sg], [fr.N[0] * sg, 0, fr.N[1] * sg], w, h, null, 1, { uv: su, whole: true, gain: 0.7, range: 10 }); }
         // (r3) chaser bulbs down the outer edge + a cap; forged arms with diagonal braces (critic: 'flat slabs, no brackets')
         const nBu = Math.max(4, Math.round((h - 0.2) / 0.17));
         C.op.quad([L(uc - 0.13, y0 + 0.1, n1 + 0.006), L(uc + 0.13, y0 + 0.1, n1 + 0.006), L(uc + 0.13, y1 - 0.1, n1 + 0.006), L(uc - 0.13, y1 - 0.1, n1 + 0.006)],
@@ -605,6 +618,7 @@ export function buildSignage({ scene, gen }) {
           for (const uu of [u0 + 0.4, u1 - 0.4]) detBox(D, fr, uu - 0.03, uu + 0.03, yt + 0.02, yt + 0.08 + dep * 0.6, 0, 0.06), detBox(D, fr, uu - 0.02, uu + 0.02, yt, yt + 0.05, 0.05, dep - 0.3);
           S.box(...aabb(fr, u0, yb, 0, u1, yt, dep), 'awning', OVERHANG);
           occAdd(...aabb(fr, u0 - 0.1, yb - 0.1, 0, u1 + 0.1, yt + 0.2, dep + 0.1));
+          SLS.point(at(fr, (u0 + u1) / 2, yb - 0.5, dep * 0.6), new THREE.Color(1.0, 0.72, 0.42), 10 + 2.5 * w, 12, 0.4); // (night) bulb-lit sidewalk
           stats.marquee = (stats.marquee ?? 0) + 1; note('marquee', fr, (u0 + u1) / 2, yb);
         }
       }
@@ -754,6 +768,7 @@ export function buildSignage({ scene, gen }) {
         boxF(C.op, fr, u0 - 0.18, u0 + w + 0.18, y0 - 0.18, y1 + 0.18, 0.02, 0.42, srgb(0x1a1b1d), null, 0, 0, 62);
         boxF(C.op, fr, u0, u0 + w, y0, y1, 0.42, 0.45, srgb(0x1a1b1d), uv, 3, nits, 1);
         S.box(...aabb(fr, u0 - 0.18, y0 - 0.18, 0, u0 + w + 0.18, y1 + 0.18, 0.45), 'equipment', OVERHANG);
+        SLS.rect(at(fr, u0 + w / 2, (y0 + y1) / 2, 0.4), [fr.N[0], 0, fr.N[1]], [fr.T[0], 0, fr.T[1]], w, h, av, 1, { uv, gain: 1.8 }); // (night) (r9: per-region colours; x1.8: a lone city screen in a dark street is the dominant local light)
         stats.led++; note('led', fr, u0 + w / 2, y0);
       }
     }
@@ -766,12 +781,13 @@ export function buildSignage({ scene, gen }) {
     const C = cellOf(c[0], c[2]);
     const uv = adLand(pickL(c[0], c[2]), w / h);
     C.op.quad([at(fr, 0, P.y0, 0), at(fr, w, P.y0, 0), at(fr, w, P.y1, 0), at(fr, 0, P.y1, 0)], [fr.N[0], 0, fr.N[1]], uv, [1, 1, 1], 1, 0);
+    SLS.rect(at(fr, w / 2, (P.y0 + P.y1) / 2, 0.03), [fr.N[0], 0, fr.N[1]], [fr.T[0], 0, fr.T[1]], w, h, null, 1, { uv, printed: true }); // (night r9)
     stats.roofPanel = (stats.roofPanel ?? 0) + 1;
   }
 
   // ---------------------------------------------------------------- meshes (one opaque mesh per 512 m cell; ghost signs are dithered into it)
   const T = gen.textures ?? null; void T;
-  const adsTex = adsTexture(), signTex = loadTex(TEX + 'ts_signs.webp');
+  const adsTex = adsTexture(), signTex = signsTexture(); // (night r5) shared sign atlas copy
   const noise = (() => { // small tiling value-noise texture (linear) for weathering
     const N = 128, dd = new Uint8Array(N * N * 4), rr = mulberry32(7), g = Array.from({ length: 16 * 16 * 3 }, () => rr());
     const sm = (t) => t * t * (3 - 2 * t);
@@ -807,6 +823,8 @@ export function buildSignage({ scene, gen }) {
     if (e.op || e.gh) list.push(e);
   }
   stats.meshes = list.reduce((a, e) => a + !!e.op + !!e.gh, 0);
+  stats.lights = SLS.commit('signage'); // (night)
+  stats.bladeLights = SLB.commit('signBlades', { grid: signsGrid(), mergeA: 0 }); // (night r9)
   console.log(`[signage] ${stats.roof} rooftop billboards (+${stats.roofPanel ?? 0} roof-kit ad faces), ${stats.front ?? 0} shop fascias, ${stats.marquee ?? 0} marquees, ${stats.wall} wall ads, ${stats.ghost} ghost signs, ${stats.blade} blade signs, ${stats.led} LED screens, ${stats.awning ?? 0} awnings, ${stats.canopy ?? 0} canopies, ${stats.letters ?? 0} lobby letters, ${stats.winLetters ?? 0} window letterings, ${stats.flag ?? 0} flags | ${list.length} cells, ${stats.meshes} meshes, ${(stats.tris / 1000).toFixed(1)}k tris`);
   if (Q.has('signdbg')) { const [qx, qz, qr] = (Q.get('signdbg') || '0,0,900').split(',').map(Number); for (const k in stats.at) console.log('[signage-at] ' + k + ' ' + JSON.stringify(stats.at[k].filter(p => Math.hypot(p[0] - qx, p[2] - qz) < qr).slice(0, 40))); }
   if (typeof window !== 'undefined') window.__signage = stats; // debug: positions for shots
